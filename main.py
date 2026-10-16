@@ -28,14 +28,20 @@ try:
     from .pokedex_db import PokedexDB, TABLES
     from .pokeapi_client import PokeAPIClient
     from .card_renderer import CardRenderer
+    from .wishmaker_card import build_wishmaker_markdown
 except ImportError:  # 兼容以普通模块方式加载插件
     from pokedex_db import PokedexDB, TABLES
     from pokeapi_client import PokeAPIClient
     from card_renderer import CardRenderer
+    from wishmaker_card import build_wishmaker_markdown
 
 POKEMON_FIELDS = ("id_raw", "form_name", "name_zh", "name_en", "generation", "types", "category",
                   "height", "weight", "abilities", "hidden_abilities", "stats",
                   "weak_to", "resist_to", "immune_to", "evolution", "dex_entries")
+
+WISHMAKER_NATURES = ("勤奋 怕寂寞 勇敢 固执 顽皮 大胆 坦率 悠闲 淘气 乐天 "
+                     "胆小 急躁 认真 爽朗 天真 内敛 慢吞吞 温和 害羞 马虎 "
+                     "沉着 温柔 自大 慎重 浮躁")
 
 
 @register("astrbot_plugin_pokedex", "ca1e",
@@ -203,6 +209,51 @@ class PokedexPlugin(Star):
         lines += ["免疫：" + "、".join(result["immune"])] if result["immune"] else []
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("许愿星")
+    async def cmd_wishmaker(self, event: AstrMessageEvent, nature: str = "",
+                            min_iv: str = "", tid: str = "", sid: str = ""):
+        """许愿星基拉祈目标筛选（红/蓝宝石），如：许愿星 固执 25 20040 0"""
+        if not nature:
+            yield event.plain_result(
+                "用法：许愿星 <性格> [个体下限] [TID SID]\n"
+                "性格：\n" + WISHMAKER_NATURES + "\n"
+                "如：许愿星 固执 25 = 六项个体≥25 的固执；末尾附 TID SID 可标注异色")
+            return
+        try:
+            iv_floor = max(0, min(31, int(min_iv))) if min_iv else 0
+            tsv = (int(tid) ^ int(sid)) if tid and sid else None
+        except ValueError:
+            yield event.plain_result("个体下限 / TID / SID 需要是数字")
+            return
+        count, rows = self.db.wishmaker_query(nature=nature, min_iv=iv_floor, tsv=tsv)
+        if not count:
+            yield event.plain_result(f"没有符合的目标（性格请从：{WISHMAKER_NATURES} 中选择）")
+            return
+        # 默认图片卡片；wishmaker_style=markdown 时走 markdown（QQ 官方 / 微信个人号等支持渲染的平台）
+        if self.config.get("wishmaker_style", "image") == "markdown":
+            result = event.plain_result(
+                build_wishmaker_markdown(nature, iv_floor, count, rows, tsv))
+            result.use_markdown(True)  # 仅支持的平台消费该标记，其他平台忽略
+            yield result
+            return
+        try:
+            png = self.renderer.render_wishmaker_card(nature, iv_floor, count, rows, tsv)
+            yield event.chain_result([Comp.Image.fromBytes(png)])
+        except Exception as e:
+            logger.warning(f"许愿星卡片渲染失败: {e}")
+            yield event.plain_result("许愿星卡片渲染失败，请稍后再试")
+
+    @staticmethod
+    def _format_wishmaker(nature: str, iv_floor: int, count: int, rows: list[dict]) -> str:
+        lines = [f"【许愿星基拉祈】性格 {nature or '任意'} · 个体≥{iv_floor}（命中 {count} 个种子）"]
+        for i, r in enumerate(rows, 1):
+            ivs = "/".join(r[k] for k in ("hp", "atk", "def", "spa", "spd", "spe"))
+            mark = " ✨异色" if r.get("shiny") else ""
+            lines.append(f"{i}. 种子 {r['seed']} | PID {r['pid']} | 个体 {ivs}（总和{r['total']}）"
+                         f"| 觉醒力量 {r['hp_type']}{r['hp_power']}{mark}")
+        lines.append("提示：种子 = 红/蓝宝石接收许愿星基拉祈时的 WishMaker 种子（16位十六进制）")
+        return "\n".join(lines)
+
     @filter.command("搜索")
     async def cmd_search(self, event: AstrMessageEvent, keyword: str = ""):
         """跨表搜索名称"""
@@ -232,6 +283,7 @@ class PokedexPlugin(Star):
             "道具 <名称> — 道具说明\n"
             "图鉴 <编号/地区> — 地区图鉴定位\n"
             "相性 <属性1> [属性2] — 属性相性（本地属性表）\n"
+            "许愿星 <性格> [个体下限] [TID SID] — 许愿星基拉祈目标筛选\n"
             "搜索 <关键词> — 跨表搜索\n"
             "群聊 @我 直接提问时也会自动调用图鉴工具（需模型支持函数调用）")
 
@@ -338,6 +390,31 @@ class PokedexPlugin(Star):
                 f"弱点：{'、'.join(result['weak']) or '无'}\n"
                 f"抗性：{'、'.join(result['resist']) or '无'}\n"
                 f"免疫：{'、'.join(result['immune']) or '无'}")
+
+    @filter.llm_tool(name="query_wishmaker_jirachi")
+    async def tool_query_wishmaker(self, event: AstrMessageEvent, nature: str = "",
+                                   min_iv: int = 0, hp_type: str = "",
+                                   tid: int = -1, sid: int = -1,
+                                   shiny_only: bool = False):
+        """查询红/蓝宝石"许愿星基拉祈"（Bonus Disc 领取）的目标种子与个体值。
+        覆盖全部 65536 个 WishMaker 种子（与 pokemonrng.com 教程数据一致），
+        可按目标性格、六项个体值下限、觉醒力量属性筛选，提供 TID/SID 时可判定异色。
+        Args:
+            nature(str): 目标性格中文名（勤奋/怕寂寞/勇敢/固执/顽皮/大胆/坦率/悠闲/淘气/乐天/胆小/急躁/认真/爽朗/天真/内敛/慢吞吞/温和/害羞/马虎/沉着/温柔/自大/慎重/浮躁），留空不限
+            min_iv(int): 六项个体值的下限（0-31），如 25 表示每项都≥25
+            hp_type(str): 觉醒力量属性中文名（格斗/飞行/毒/地面/岩石/虫/幽灵/钢/火/水/草/电/超能力/冰/龙/恶），留空不限
+            tid(int): 训练家 ID（异色判定用），不知道传 -1
+            sid(int): 隐藏 ID（异色判定用），不知道传 -1
+            shiny_only(bool): 只看异色目标（需提供 tid 和 sid）
+        """
+        tsv = (tid ^ sid) if tid >= 0 and sid >= 0 else None
+        iv_floor = max(0, min(31, min_iv))
+        count, rows = self.db.wishmaker_query(nature=nature or None, min_iv=iv_floor,
+                                              hp_type=hp_type or None, tsv=tsv,
+                                              shiny_only=shiny_only, limit=10)
+        if not count:
+            return "没有符合条件的目标，请放宽个体值下限或核对性格/属性名称"
+        return self._format_wishmaker(nature, iv_floor, count, rows)
 
     @filter.llm_tool(name="find_pokemon_by_type")
     async def tool_find_by_type(self, event: AstrMessageEvent, type_name: str):

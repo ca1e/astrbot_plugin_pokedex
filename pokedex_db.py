@@ -20,6 +20,7 @@ TABLES = {
     "item": "item_list.tsv",
     "pokedex": "pokedex.tsv",
     "types": "types.tsv",
+    "wishmaker": "wishmaker.tsv",
 }
 SEARCH_TABLES = ["simple", "pokemon", "ability", "move", "item"]
 ID_COLS = ("id", "id_raw", "national_id")
@@ -108,10 +109,50 @@ class PokedexDB:
                 m *= chart.get((dt, atk), 1.0)
             if m == 1:
                 continue
-            key = "weak" if m > 1 else ("immune" if m == 0 else "resist")
-            out.setdefault(key, []).append(f"{atk}×{m:g}")
+            if m == 0:
+                out.setdefault("immune", []).append(atk)
+            else:
+                key = "weak" if m > 1 else "resist"
+                out.setdefault(key, []).append(f"{atk}×{m:g}")
         return {"weak": out.get("weak", []), "resist": out.get("resist", []),
                 "immune": out.get("immune", [])}
+
+    # ---------- 许愿星基拉祈（WishMaker） ----------
+    WISHMAKER_IV_KEYS = ("hp", "atk", "def", "spa", "spd", "spe")
+
+    def wishmaker_query(self, nature: str | None = None, min_iv: int = 0,
+                        hp_type: str | None = None, tsv: int | None = None,
+                        shiny_only: bool = False, limit: int = 20) -> tuple[int, list[dict]]:
+        """筛选许愿星基拉祈目标（数据覆盖全部 65536 个 WishMaker 种子）。
+
+        nature/hp_type 传中文名精确匹配，min_iv 为六项个体下限；tsv=TID^SID 时
+        附加 shiny 字段（WishMaker PID 判定式与第三代一致）。返回 (命中总数, 前
+        limit 条)，按个体总和降序、seed 升序。
+        """
+        iv_keys = self.WISHMAKER_IV_KEYS
+        hits = []
+        for r in self.table("wishmaker"):
+            if nature and r["nature"] != nature:
+                continue
+            if hp_type and r["hp_type"] != hp_type:
+                continue
+            ivs = [int(r[k]) for k in iv_keys]
+            if min(ivs) < min_iv:
+                continue
+            row = dict(r, total=sum(ivs), shiny=None)
+            if tsv is not None:
+                pid = int(r["pid"], 16)
+                row["shiny"] = ((pid >> 16) ^ (pid & 0xFFFF) ^ tsv) < 8
+            if shiny_only and not row["shiny"]:
+                continue
+            hits.append(row)
+        hits.sort(key=lambda r: (-r["total"], int(r["seed"], 16)))
+        return len(hits), hits[:limit]
+
+    def wishmaker_seed(self, seed_hex: str) -> dict | None:
+        """按 16 进制种子查单条许愿星基拉祈数据（如 "353d"）。"""
+        seed_hex = seed_hex.strip().lower().removeprefix("0x")
+        return next((r for r in self.table("wishmaker") if r["seed"] == seed_hex), None)
 
     def format_row(self, row: dict, fields=None, max_cell=400) -> str:
         cols = fields or list(row.keys())
@@ -133,32 +174,41 @@ class PokedexDB:
         vals = [int(x) for x in m.groups()[:6]]
         return list(zip(labels, vals)), int(m.group(7))
 
-    def find_image(self, row: dict, images_dir) -> Path | None:
-        """在数据集 images 目录中找官方立绘 official/{id_raw}-{名称}[-形态].png（排除闪光）。
+    def find_image(self, row: dict, images_dir, shiny: bool = False) -> Path | None:
+        """在数据集 images 目录中找立绘 {sub}/{id_raw}-{名称}[-形态][-shiny].png。
 
-        形态行优先匹配形态名（找不到形态图就返回 None，避免用默认形态图张冠李戴）；
+        闪光立绘 official 子目录无收录，回退 home。形态行优先匹配形态名
+        （找不到形态图就返回 None，避免用默认形态图张冠李戴）；
         默认行优先精确同名，再排除 other_forms 中列出的非默认形态后取文件名最短的。
         """
         if not images_dir:
             return None
-        base = Path(images_dir) / "official"
-        if not base.is_dir():
-            return None
-        prefix = f"{row.get('id_raw', '')}-{row.get('name_zh', '')}"
-        form = (row.get("form_name") or "").strip()
-        if form:
-            exact = base / f"{prefix}-{form}.png"
+        suffix = "-shiny" if shiny else ""
+        for sub in ("official", "home"):
+            base = Path(images_dir) / sub
+            if not base.is_dir():
+                continue
+            prefix = f"{row.get('id_raw', '')}-{row.get('name_zh', '')}"
+            form = (row.get("form_name") or "").strip()
+            if form:
+                exact = base / f"{prefix}-{form}{suffix}.png"
+                if exact.is_file():
+                    return exact
+                cands = [p for p in base.glob(f"{prefix}-{form}*{suffix}.png")
+                         if shiny or "-shiny" not in p.name]
+                if cands:
+                    return min(cands, key=lambda p: (len(p.name), p.name))
+                continue
+            exact = base / f"{prefix}{suffix}.png"
             if exact.is_file():
                 return exact
-            cands = [p for p in base.glob(f"{prefix}-{form}*.png") if "-shiny" not in p.name]
-            return min(cands, key=lambda p: (len(p.name), p.name)) if cands else None
-        exact = base / f"{prefix}.png"
-        if exact.is_file():
-            return exact
-        cands = [p for p in base.glob(f"{prefix}-*.png") if "-shiny" not in p.name]
-        if not cands:
-            return None
-        non_default = {f.split("（")[0] for f in (row.get("other_forms") or "").split("、") if f}
-        preferred = [p for p in cands
-                     if p.name[len(prefix) + 1:-4] not in non_default] or cands
-        return min(preferred, key=lambda p: (len(p.name), p.name))
+            cands = [p for p in base.glob(f"{prefix}-*{suffix}.png")
+                     if shiny or "-shiny" not in p.name]
+            if not cands:
+                continue
+            non_default = {f.split("（")[0] for f in (row.get("other_forms") or "").split("、") if f}
+            trim = len(suffix) + 4
+            preferred = [p for p in cands
+                         if p.name[len(prefix) + 1:-trim] not in non_default] or cands
+            return min(preferred, key=lambda p: (len(p.name), p.name))
+        return None

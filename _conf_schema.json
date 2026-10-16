@@ -11,6 +11,12 @@
     "default": true,
     "hint": "宝可梦指令以图片卡片返回；关闭后返回纯文本。"
   },
+  "wishmaker_style": {
+    "description": "许愿星结果输出样式",
+    "type": "string",
+    "default": "image",
+    "hint": "image=图片卡片（默认）；markdown=markdown 文本，适用于天然渲染 markdown 的平台（QQ 官方机器人、微信个人号等）。"
+  },
   "fallback_web_image": {
     "description": "本地立绘缺失时使用网络官方图",
     "type": "bool",
