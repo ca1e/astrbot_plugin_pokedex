@@ -1,0 +1,31 @@
+{
+  "images_dir": {
+    "description": "宝可梦图片目录",
+    "type": "string",
+    "default": "",
+    "hint": "指向 pokemon-dataset-zh/data/images 目录（含 official/home 子目录）。留空则卡片不带本地立绘，按下方网络图回退。"
+  },
+  "enable_image_card": {
+    "description": "启用图片卡片",
+    "type": "bool",
+    "default": true,
+    "hint": "宝可梦指令以图片卡片返回；关闭后返回纯文本。"
+  },
+  "fallback_web_image": {
+    "description": "本地立绘缺失时使用网络官方图",
+    "type": "bool",
+    "default": true,
+    "hint": "从 PokéAPI 官方图源下载立绘渲染卡片（仅默认形态）；无外网环境可关闭。"
+  },
+  "pokeapi_enabled": {
+    "description": "启用 PokéAPI 补充查询",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不使用 PokéAPI（本地调试/离线环境建议关闭），仅保留本地图鉴与本地属性表。"
+  },
+  "pokeapi_timeout": {
+    "description": "PokéAPI 请求超时（秒）",
+    "type": "int",
+    "default": 15
+  }
+}

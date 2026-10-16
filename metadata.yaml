@@ -1,0 +1,33 @@
+name: "astrbot_plugin_pokedex"
+display_name: "宝可梦图鉴"
+desc: "宝可梦图鉴插件：内置 pokemon-dataset-zh 中文图鉴库（1025 只宝可梦 + 295 个形态、特性、招式、道具、24 个地区图鉴、基准属性表），支持指令与 LLM 函数调用查询，图鉴结果以图片卡片展示。查询优先使用本地中文数据，PokéAPI 官方数据作为补充（可配置关闭，纯离线运行）。"
+version: "v0.1.0"
+author: "ca1e"
+repo: ""
+homepage: ""
+license: "MIT"
+tags:
+  - "宝可梦"
+  - "pokemon"
+  - "图鉴"
+  - "游戏"
+compatibility:
+  min_astrbot_version: "4.0.0"
+platforms:
+  - "aiocqhttp"
+  - "qq"
+  - "qq_official"
+  - "telegram"
+  - "gewechat"
+features:
+  - "本地中文图鉴查询（编号/名称/形态名，精确匹配）"
+  - "图片卡片展示（Pillow 渲染，无浏览器依赖）"
+  - "LLM 函数调用工具（群聊 @机器人 自然语言查询）"
+  - "属性相性查询（本地基准属性表，已与官方标准核对）"
+  - "PokéAPI 官方数据补充（详情/相性，可配置关闭）"
+  - "特性/招式/道具/地区图鉴查询"
+keywords:
+  - pokemon
+  - 宝可梦
+  - 图鉴
+  - pokeapi
