@@ -601,6 +601,53 @@ def test_phase4_team_and_stats():
     check("无命中返回空列表", db.by_stats([("总和", ">", 9999)]) == [])
 
 
+# ---------------- 受击类特性免疫 / 相性修正 ----------------
+def test_ability_corrections():
+    section("受击类特性映射 / 相性修正字段")
+    db = PokedexDB()
+    check(
+        "皮卡丘隐藏特性避雷针 → 免疫 电",
+        db.ability_immunities(db.pokemon("皮卡丘")) == [("电", "避雷针")],
+    )
+    check("无相关特性的宝可梦返回空", db.ability_immunities(db.pokemon("大岩蛇")) == [])
+
+    floats = [
+        r
+        for r in db.table("pokemon")
+        if not r.get("form_name") and "飘浮" in (r.get("abilities") or "")
+    ]
+    check("数据集中存在飘浮特性持有者", bool(floats))
+    if floats:
+        check(
+            f"飘浮持有者（{floats[0]['name_zh']}）→ 免疫 地面",
+            db.ability_immunities(floats[0]) == [("地面", "飘浮")],
+        )
+
+    r = db.matchups(["电"])
+    corr = {c["type"]: c for c in r["ability_corrections"]}
+    check(
+        "相性 电：地面×2 可被飘浮免疫",
+        corr.get("地面", {}).get("abilities") == ["飘浮"]
+        and corr["地面"]["current_mult"] == 2.0,
+    )
+    check(
+        "相性 电：避雷针/蓄电 合并展示（现×0.5）",
+        set(corr.get("电", {}).get("abilities", [])) == {"避雷针", "蓄电"}
+        and corr["电"]["current_mult"] == 0.5,
+    )
+    check(
+        "修正按当前倍率降序",
+        [c["current_mult"] for c in r["ability_corrections"]]
+        == sorted((c["current_mult"] for c in r["ability_corrections"]), reverse=True),
+    )
+
+    r2 = db.matchups(["一般"])
+    corr2 = {c["type"] for c in r2["ability_corrections"]}
+    check("已免疫属性不重复修正（幽灵打一般 0× 不出现）", "幽灵" not in corr2)
+    check("无对应免疫特性的属性不出现（格斗打一般 2×）", "格斗" not in corr2)
+    check("火属性有引火修正", "火" in corr2)
+
+
 from pokedex_db import PokedexDB
 
 if __name__ == "__main__":
@@ -612,6 +659,7 @@ if __name__ == "__main__":
     test_phase2_data_quality()
     test_phase3_battle()
     test_phase4_team_and_stats()
+    test_ability_corrections()
     test_main_imports()
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     sys.exit(1 if FAIL else 0)

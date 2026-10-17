@@ -11,6 +11,11 @@ import re
 from pathlib import Path
 from typing import ClassVar
 
+try:
+    from .battle_engine import DEFENSIVE_ABILITY_IMMUNITY
+except ImportError:
+    from battle_engine import DEFENSIVE_ABILITY_IMMUNITY
+
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 TABLES = {
@@ -139,11 +144,52 @@ class PokedexDB:
             else:
                 key = "weak" if m > 1 else "resist"
                 out.setdefault(key, []).append(f"{atk}×{m:g}")
+        # 受击类特性修正：当前 >0× 的进攻属性中，有哪些可被特性免疫（如避雷针→电）
+        corrections = []
+        for ab, t in DEFENSIVE_ABILITY_IMMUNITY.items():
+            if t not in attackers:
+                continue
+            m = 1.0
+            for dt in type_names:
+                m *= chart.get((dt, t), 1.0)
+            if m > 0:
+                corrections.append((t, ab, m))
+        grouped: dict[str, tuple[float, list[str]]] = {}
+        for t, ab, m in corrections:
+            cur_m, abil = grouped.get(t, (m, []))
+            grouped[t] = (cur_m, [*abil, ab])
+        ability_corrections = [
+            {"type": t, "current_mult": m, "abilities": abil}
+            for t, (m, abil) in sorted(grouped.items(), key=lambda x: -x[1][0])
+        ]
         return {
             "weak": out.get("weak", []),
             "resist": out.get("resist", []),
             "immune": out.get("immune", []),
+            "ability_corrections": ability_corrections,
         }
+
+    def ability_immunities(self, row: dict) -> list[tuple[str, str]]:
+        """该宝可梦（含隐藏特性）可经受击类特性获得的 (免疫属性, 特性) 列表。
+
+        属性表已免疫的属性不再重复列出。
+        """
+        has = {
+            a
+            for a in (
+                (row.get("abilities") or "")
+                + "、"
+                + (row.get("hidden_abilities") or "")
+            ).split("、")
+            if a
+        }
+        existing = {t for t in (row.get("immune_to") or "").split("、") if t}
+        out, seen = [], set()
+        for ab, t in DEFENSIVE_ABILITY_IMMUNITY.items():
+            if ab in has and t not in existing and t not in seen:
+                out.append((t, ab))
+                seen.add(t)
+        return out
 
     # ---------- 属性相性（进攻方向 / 互克倍率） ----------
     def type_chart(self) -> dict[tuple[str, str], float]:

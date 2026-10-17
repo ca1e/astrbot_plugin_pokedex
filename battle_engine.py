@@ -49,6 +49,17 @@ STATUS_IMMUNE_TYPES: dict[str, set[str]] = {
     "中毒": {"毒", "钢"},
 }
 
+# 受击类特性 → 免疫属性：持有该特性时对应属性招式对自身无效（特性覆盖属性表）。
+# 仅收录纯免疫特性；干燥皮肤（水免疫但火弱点×1.25）等附带修正的特性暂不收录。
+# 特性名与本地特性总表一致（该数据集作「飘浮」）。
+DEFENSIVE_ABILITY_IMMUNITY: dict[str, str] = {
+    "避雷针": "电",
+    "蓄电": "电",
+    "引火": "火",
+    "储水": "水",
+    "飘浮": "地面",
+}
+
 
 def _first_int(text) -> int | None:
     m = re.search(r"\d+", str(text or ""))

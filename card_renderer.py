@@ -528,6 +528,7 @@ class CardRenderer:
         image: Image.Image | None = None,
         evo_chain: list | None = None,
         shiny_image: Image.Image | None = None,
+        ability_immune: list[tuple[str, str]] | None = None,
     ) -> bytes:
         W, PAD = 1080, 44
         name_font, mid_font, small_font, badge_font = (
@@ -602,10 +603,19 @@ class CardRenderer:
             ("免疫", "immune_to"),
         ):
             vals = [v for v in (row.get(key) or "").split("、") if v]
+            if key == "immune_to" and ability_immune:
+                # 受击类特性带来的条件免疫，如「电【避雷针】」
+                vals += [f"{t}【{ab}】" for t, ab in ability_immune]
             if not vals:
                 continue
             badges = [
-                (v, TYPE_COLORS.get(v.split("×", 1)[0], (120, 120, 120))) for v in vals
+                (
+                    v,
+                    TYPE_COLORS.get(
+                        v.split("×", 1)[0].split("【", 1)[0], (120, 120, 120)
+                    ),
+                )
+                for v in vals
             ]
             lines, cur, bx = [], [], PAD + 90
             for item in badges:
@@ -845,7 +855,15 @@ class CardRenderer:
                     chain = self._resolve_evo_images(chain, db)
                     if any(img for seg in chain for _, _, img in seg):
                         evo_chain = chain
-            return self.render_pokemon_card(row, stats, total, art, evo_chain, shiny)
+            return self.render_pokemon_card(
+                row,
+                stats,
+                total,
+                art,
+                evo_chain,
+                shiny,
+                db.ability_immunities(row),
+            )
         except Exception as e:
             logger.warning(f"卡片渲染失败: {e}")
             return None

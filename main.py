@@ -288,6 +288,16 @@ class PokedexPlugin(Star):
                 )
         yield event.plain_result("\n".join(lines))
 
+    @staticmethod
+    def _ability_correction_text(result: dict) -> str:
+        """把 matchups 的 ability_corrections 压成一行提示，无修正返回空串。"""
+        parts = []
+        for c in result.get("ability_corrections", []):
+            abil = "/".join(c["abilities"])
+            cur = "" if c["current_mult"] == 1 else f"（现×{c['current_mult']:g}）"
+            parts.append(f"持「{abil}」免疫 {c['type']}{cur}")
+        return "特性修正：" + "；".join(parts) if parts else ""
+
     @filter.command("相性")
     async def cmd_matchups(
         self, event: AstrMessageEvent, type1: str = "", type2: str = ""
@@ -313,6 +323,9 @@ class PokedexPlugin(Star):
             else ["抗性：无"]
         )
         lines += ["免疫：" + "、".join(result["immune"])] if result["immune"] else []
+        corr = self._ability_correction_text(result)
+        if corr:
+            lines.append(corr)
         yield event.plain_result("\n".join(lines))
 
     # ---------- Phase 1：能力值 / 进攻相性 / 对比 / 怎么打 ----------
@@ -881,12 +894,16 @@ class PokedexPlugin(Star):
         if result is None:
             return f"没有查到属性「{type1}{'/' + type2 if type2 else ''}」"
         combo = "/".join(x for x in (type1, type2) if x)
-        return (
+        text = (
             f"【{combo}】\n"
             f"弱点：{'、'.join(result['weak']) or '无'}\n"
             f"抗性：{'、'.join(result['resist']) or '无'}\n"
             f"免疫：{'、'.join(result['immune']) or '无'}"
         )
+        corr = self._ability_correction_text(result)
+        if corr:
+            text += f"\n{corr}（若防守方宝可梦持有对应特性则生效）"
+        return text
 
     @filter.llm_tool(name="query_wishmaker_jirachi")
     async def tool_query_wishmaker(
