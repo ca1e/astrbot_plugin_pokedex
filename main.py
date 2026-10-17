@@ -4,19 +4,23 @@
 + Pillow 图片卡片为主，PokéAPI 官方数据作为补充（可在配置中关闭）。
 属性相性优先使用本地 types.tsv 基准属性表。
 
+设计原则：LLM 工具保持原子化（供模型组合调用）；聊天指令只保留粗粒度
+功能模块，不镜像每个原子能力（跨表搜索等原子能力仅存在于工具层）。
+
 指令：
-  宝可梦 <编号或名称>   图鉴详情（图片卡片）
-  特性 <名称>           特性查询
-  招式 <名称>           招式查询
-  道具 <名称>           道具查询
-  图鉴 <编号或地区>     地区图鉴定位
-  相性 <属性1> [属性2]  属性相性（本地属性表）
-  搜索 <关键词>         跨表搜索
-  宝可梦帮助            帮助
+  宝可梦                帮助（宝可梦 <名> 招式表/能力值 … 为其子视图）
+  宝可梦 <编号或名称>   图鉴详情（图片卡片，含冠军赛名次）
+  特性/招式/道具 <名称> 数据查询
+  相性 <属性1> [属性2]  属性相性（相性 打 <属性> = 进攻方向）
+  克制 <宝可梦> [B]     克制推荐 / 多维度对比
+  对战/队伍分析/筛选    组合分析
+  冠军 <关键词>         冠军赛一站式查询
+  许愿星 <…>            许愿星基拉祈 RNG 筛选
 """
 
 import re
 from pathlib import Path
+from typing import ClassVar
 
 import aiohttp
 import astrbot.api.message_components as Comp
@@ -34,6 +38,12 @@ try:
         make_move,
     )
     from .card_renderer import CardRenderer
+    from .champions_db import (
+        OPTION_LABELS,
+        ChampionsDB,
+        fmt_label,
+        source_label,
+    )
     from .pokeapi_client import PokeAPIClient
     from .pokedex_db import TABLES, PokedexDB
     from .wishmaker_card import build_wishmaker_markdown
@@ -47,6 +57,12 @@ except ImportError:  # 兼容以普通模块方式加载插件
         make_move,
     )
     from card_renderer import CardRenderer
+    from champions_db import (
+        OPTION_LABELS,
+        ChampionsDB,
+        fmt_label,
+        source_label,
+    )
     from pokeapi_client import PokeAPIClient
     from pokedex_db import TABLES, PokedexDB
     from wishmaker_card import build_wishmaker_markdown
@@ -111,6 +127,8 @@ class PokedexPlugin(Star):
         self.db = PokedexDB(Path(__file__).resolve().parent / "data")
         self.renderer = CardRenderer(images_dir or None)
         self.api = PokeAPIClient(timeout=int(self.config.get("pokeapi_timeout", 15)))
+        # 冠军赛季数据：只读 champions.db（由独立脚本 champions_fetch.py 抓取）
+        self.champions = ChampionsDB(self.config.get("champions_db_path") or None)
 
     async def terminate(self):
         await self.api.close()
@@ -143,13 +161,29 @@ class PokedexPlugin(Star):
             logger.warning(f"网络立绘获取失败: {e}")
         return None
 
+    def _champ_card_info(self, row: dict) -> dict | None:
+        """图鉴卡片头部的冠军赛名次条数据；无数据/形态行返回 None。"""
+        if not self.champions.exists or row.get("form_name"):
+            return None
+        ranks = self.champions.pokemon_ranks(row.get("name_zh", ""))
+        if not ranks:
+            return None
+        return {
+            "season": ranks[0]["season"],
+            "total": max(r["total"] for r in ranks),
+            "single": next((r["rank"] for r in ranks if r["format"] == "single"), None),
+            "double": next((r["rank"] for r in ranks if r["format"] == "double"), None),
+        }
+
     async def _send_pokemon(
         self, event: AstrMessageEvent, row: dict, card: bool, hint: str = ""
     ):
         text = self.db.format_row(row, fields=POKEMON_FIELDS) + hint
         if card and self.config.get("enable_image_card", True):
             img_bytes = await self._artwork_bytes(row)
-            png = await self.renderer.render_pokemon(row, self.db, img_bytes)
+            png = await self.renderer.render_pokemon(
+                row, self.db, img_bytes, champion=self._champ_card_info(row)
+            )
             if png:
                 comps = [Comp.Image.fromBytes(png)]
                 if hint:
@@ -159,16 +193,51 @@ class PokedexPlugin(Star):
             logger.warning("卡片渲染失败，回退文本")
         yield event.plain_result(text)
 
+    def _pokemon_related_hint(self, row: dict) -> str:
+        """图鉴卡片尾部的关联指令反查提示（冠军赛名次 + 常用后续查询）。"""
+        name = row.get("name_zh", "")
+        if not name:
+            return ""
+        parts = []
+        champ = self._champ_rank_short(name)
+        if champ:
+            parts.append(f"冠军赛 {champ}（冠军 {name} 看配置）")
+        if not row.get("form_name"):
+            parts.append(f"宝可梦 {name} 招式表")
+            parts.append(f"宝可梦 {name} 能力值 50")
+        parts.append(f"克制 {name}")
+        return "\n———\n相关：" + "｜".join(parts)
+
     # ---------- 指令 ----------
     @filter.command("宝可梦")
     async def cmd_pokemon(self, event: AstrMessageEvent, keyword: str = ""):
-        """查询宝可梦图鉴（编号或名称），图片卡片展示"""
-        if not keyword:
+        """宝可梦图鉴卡；宝可梦 <名> 招式表 [等级]｜宝可梦 <名> 能力值 [等级 个体 性格]"""
+        tokens = (keyword or "").split()
+        if tokens and tokens[0] in {"招式表", "能力值"}:
             yield event.plain_result(
-                "用法：宝可梦 <编号或名称>，如：宝可梦 999 / 宝可梦 索财灵"
+                "用法：宝可梦 <名称> 招式表 [等级]\n"
+                "　　宝可梦 <名称> 能力值 [等级 个体 性格]\n"
+                "如：宝可梦 皮卡丘 招式表 50 / 宝可梦 皮卡丘 能力值 50 31 固执"
             )
             return
-        rows = self.db.query("pokemon", keyword)
+        name = tokens[0] if tokens else ""
+        if not name:
+            yield event.plain_result(self._help_text())
+            return
+        sub = tokens[1] if len(tokens) > 1 else ""
+        if sub == "招式表":
+            level = tokens[2] if len(tokens) > 2 else ""
+            async for r in self._learnset_view(event, name, level):
+                yield r
+            return
+        if sub == "能力值":
+            level = tokens[2] if len(tokens) > 2 else "50"
+            iv = tokens[3] if len(tokens) > 3 else "31"
+            nature = tokens[4] if len(tokens) > 4 else ""
+            async for r in self._stats_view(event, name, level, iv, nature):
+                yield r
+            return
+        rows = self.db.query("pokemon", name)
         if not rows:
             yield event.plain_result(f"没有查到「{keyword}」的相关信息")
             return
@@ -176,9 +245,9 @@ class PokedexPlugin(Star):
         others = sorted(
             {r["form_name"] for r in rows if r.get("form_name") and r is not row}
         )
-        hint = ""
+        hint = self._pokemon_related_hint(row)
         if others:
-            hint = (
+            hint += (
                 f"\n\n———\n还匹配到其他形态：{'、'.join(others)}\n"
                 f"发送「宝可梦 {others[0]}」查看对应形态"
             )
@@ -263,31 +332,6 @@ class PokedexPlugin(Star):
             f"类别：{r.get('category_path', '')}\n说明：{r.get('description', '')}"
         )
 
-    @filter.command("图鉴")
-    async def cmd_dex(self, event: AstrMessageEvent, keyword: str = ""):
-        """在 24 个地区图鉴中定位（编号或地区名）"""
-        if not keyword:
-            yield event.plain_result(
-                "用法：图鉴 <编号> 或 图鉴 <地区名>，如：图鉴 999 / 图鉴 丰缘"
-            )
-            return
-        rows = self.db.query("pokedex", keyword)
-        if not rows:
-            yield event.plain_result(f"没有查到「{keyword}」的图鉴记录")
-            return
-        lines = []
-        for r in rows[:10]:
-            if r.get("dex") == "national":
-                lines.append(
-                    f"全国图鉴 {r['id_raw']}：{r.get('name', '')}（{r.get('types', '')}）"
-                )
-            else:
-                lines.append(
-                    f"{r.get('dex', '')}图鉴 {r.get('id_raw', '')}"
-                    f"（全国 {r.get('national_id', '')}）：{r.get('name', '')}（{r.get('types', '')}）"
-                )
-        yield event.plain_result("\n".join(lines))
-
     @staticmethod
     def _ability_correction_text(result: dict) -> str:
         """把 matchups 的 ability_corrections 压成一行提示，无修正返回空串。"""
@@ -302,9 +346,20 @@ class PokedexPlugin(Star):
     async def cmd_matchups(
         self, event: AstrMessageEvent, type1: str = "", type2: str = ""
     ):
-        """属性相性（本地属性表），如：相性 火 飞行"""
+        """属性相性（本地属性表）：相性 火 飞行 = 防守；相性 打 火 = 进攻"""
+        offense = False
+        if type1 in {"打", "进攻", "攻击"}:  # 相性 打 火
+            offense = True
+            type1, type2 = type2, ""
         if not type1:
-            yield event.plain_result("用法：相性 <属性1> [属性2]，如：相性 火 飞行")
+            yield event.plain_result(
+                "用法：相性 <属性1> [属性2] = 防守方向；相性 打 <属性> = 进攻方向\n"
+                "如：相性 火 飞行 / 相性 打 火"
+            )
+            return
+        if offense:
+            async for r in self._offense_text(event, type1):
+                yield r
             return
         result = self.db.matchups([t for t in (type1, type2) if t])
         if result is None:
@@ -326,6 +381,19 @@ class PokedexPlugin(Star):
         corr = self._ability_correction_text(result)
         if corr:
             lines.append(corr)
+        yield event.plain_result("\n".join(lines))
+
+    async def _offense_text(self, event: AstrMessageEvent, type_name: str):
+        """进攻方向相性（原「克制」指令体）。"""
+        result = self.db.attack_matchups(type_name)
+        if result is None:
+            yield event.plain_result(f"没有查到属性「{type_name}」")
+            return
+        lines = [f"【{type_name}属性攻击】"]
+        lines.append("效果拔群：" + ("、".join(result["super"]) or "无"))
+        lines.append("收效甚微：" + ("、".join(result["weak"]) or "无"))
+        if result["none"]:
+            lines.append("无效：" + "、".join(result["none"]))
         yield event.plain_result("\n".join(lines))
 
     # ---------- Phase 1：能力值 / 进攻相性 / 对比 / 怎么打 ----------
@@ -357,25 +425,13 @@ class PokedexPlugin(Star):
         except (TypeError, ValueError):
             return default
 
-    @filter.command("能力值")
-    async def cmd_stats(
-        self,
-        event: AstrMessageEvent,
-        keyword: str = "",
-        level: str = "50",
-        iv: str = "31",
-        nature: str = "",
+    async def _stats_view(
+        self, event: AstrMessageEvent, name: str, level: str, iv: str, nature: str
     ):
-        """计算等级能力值，如：能力值 皮卡丘 50 31 固执"""
-        if not keyword:
-            yield event.plain_result(
-                "用法：能力值 <名称> [等级] [个体] [性格]\n"
-                "如：能力值 皮卡丘 50 31 固执（等级默认50，个体默认31，性格可省略）"
-            )
-            return
-        row = self.db.pokemon(keyword)
+        """「宝可梦 <名> 能力值 …」子视图：等级能力值计算。"""
+        row = self.db.pokemon(name)
         if not row:
-            yield event.plain_result(f"没有查到「{keyword}」的相关信息")
+            yield event.plain_result(f"没有查到「{name}」的相关信息")
             return
         if nature and nature not in NATURES:
             yield event.plain_result(
@@ -385,25 +441,6 @@ class PokedexPlugin(Star):
         level_i = self._parse_clamped_int(level, 50, 1, 100)
         iv_i = self._parse_clamped_int(iv, 31, 0, 31)
         yield event.plain_result(self._calc_stats_text(row, level_i, iv_i, nature))
-
-    @filter.command("克制")
-    async def cmd_offense(self, event: AstrMessageEvent, type_name: str = ""):
-        """属性进攻相性，如：克制 火"""
-        if not type_name:
-            yield event.plain_result(
-                "用法：克制 <属性>，如：克制 火（查「打谁效果拔群」）"
-            )
-            return
-        result = self.db.attack_matchups(type_name)
-        if result is None:
-            yield event.plain_result(f"没有查到属性「{type_name}」")
-            return
-        lines = [f"【{type_name}属性攻击】"]
-        lines.append("效果拔群：" + ("、".join(result["super"]) or "无"))
-        lines.append("收效甚微：" + ("、".join(result["weak"]) or "无"))
-        if result["none"]:
-            lines.append("无效：" + "、".join(result["none"]))
-        yield event.plain_result("\n".join(lines))
 
     @staticmethod
     def _stat_compare_line(label: str, v1: int, v2: int, n1: str, n2: str) -> str:
@@ -425,7 +462,7 @@ class PokedexPlugin(Star):
         m12 = self.db.matchup_multiplier(t1, t2)
         m21 = self.db.matchup_multiplier(t2, t1)
         lines = [
-            f"【{n1} vs {n2}】",
+            f"【克制对比：{n1} vs {n2}】",
             f"属性：{row1.get('types', '')} vs {row2.get('types', '')}",
         ]
         for (label, v1), (_, v2) in zip(parsed1[0], parsed2[0]):
@@ -435,17 +472,49 @@ class PokedexPlugin(Star):
         ab1 = row1.get("abilities", "") or ""
         ab2 = row2.get("abilities", "") or ""
         lines.append(f"特性：{n1} {ab1}｜{n2} {ab2}")
+        lines.append(self._compare_verdict(n1, n2, parsed1[1], parsed2[1], m12, m21))
         return "\n".join(lines)
 
-    @filter.command("对比")
-    async def cmd_compare(
+    @staticmethod
+    def _compare_verdict(
+        n1: str, n2: str, total1: int, total2: int, m12: float, m21: float
+    ) -> str:
+        """多维度小结：面板强弱 + 属性克制关系（统一视角，不分攻防）。"""
+        if m12 >= 2 and m21 <= 1:
+            rel = f"{n1} 属性克制 {n2}"
+        elif m21 >= 2 and m12 <= 1:
+            rel = f"{n2} 属性克制 {n1}"
+        elif m12 >= 2 and m21 >= 2:
+            rel = "双方互为效果拔群（对攻）"
+        else:
+            rel = "属性互不克制"
+        if total1 == total2:
+            panel = "面板持平"
+        else:
+            win = n1 if total1 > total2 else n2
+            panel = f"{win} 面板更高（{max(total1, total2)} vs {min(total1, total2)}）"
+        return f"小结：{panel}，{rel}"
+
+    @filter.command("克制")
+    async def cmd_counter(
         self, event: AstrMessageEvent, name1: str = "", name2: str = ""
     ):
-        """对比两只宝可梦的种族值/属性互克/特性，如：对比 皮卡丘 喷火龙"""
-        if not name1 or not name2:
+        """克制关系：克制 <宝可梦> = 推荐克制它的；克制 <A> <B> = 多维度对比"""
+        if not name1:
             yield event.plain_result(
-                "用法：对比 <名称1> <名称2>，如：对比 皮卡丘 喷火龙"
+                "用法：克制 <宝可梦> = 推荐克制它的候选\n"
+                "　　克制 <A> <B> = 两只多维度对比（面板/属性互克/特性）\n"
+                "如：克制 妙蛙花 / 克制 皮卡丘 喷火龙"
             )
+            return
+        if not name2:
+            result = self.db.find_counters(name1)
+            if not result:
+                yield event.plain_result(
+                    f"没有查到「{name1}」的相关信息（查属性相性用 相性 <属性>）"
+                )
+                return
+            yield event.plain_result(self._counters_text(result))
             return
         row1, row2 = self.db.pokemon(name1), self.db.pokemon(name2)
         if not row1 or not row2:
@@ -454,18 +523,11 @@ class PokedexPlugin(Star):
             return
         yield event.plain_result(self._compare_text(row1, row2))
 
-    @filter.command("怎么打")
-    async def cmd_counters(self, event: AstrMessageEvent, keyword: str = ""):
-        """推荐克制某宝可梦的候选，如：怎么打 妙蛙花"""
-        if not keyword:
-            yield event.plain_result("用法：怎么打 <名称>，如：怎么打 妙蛙花")
-            return
-        result = self.db.find_counters(keyword)
-        if not result:
-            yield event.plain_result(f"没有查到「{keyword}」的相关信息")
-            return
+    @staticmethod
+    def _counters_text(result: dict) -> str:
+        """「克制 X」文本：双向验证的克制候选。"""
         lines = [
-            f"【怎么打 {result['target']}（{result['target_types']}）】",
+            f"【克制 {result['target']}（{result['target_types']}）】",
             "筛选条件：打它 ≥2× 且它打你 ≤1×，按打击倍率与种族值排序",
         ]
         for i, c in enumerate(result["counters"], 1):
@@ -475,7 +537,7 @@ class PokedexPlugin(Star):
             )
         if len(lines) == 2:
             lines.append("没有同时满足条件的宝可梦，可放宽要求参考属性相性")
-        yield event.plain_result("\n".join(lines))
+        return "\n".join(lines)
 
     # ---------- Phase 2：招式表 / 配招 ----------
     def _learnset_text(self, row: dict, level: int | None) -> str:
@@ -504,17 +566,11 @@ class PokedexPlugin(Star):
         lines.append(f"推荐配招：{'、'.join(rec)}{tag}")
         return "\n".join(lines)
 
-    @filter.command("招式表")
-    async def cmd_learnset(
-        self, event: AstrMessageEvent, keyword: str = "", level: str = ""
-    ):
-        """查询宝可梦可学招式与推荐配招，如：招式表 皮卡丘 50"""
-        if not keyword:
-            yield event.plain_result("用法：招式表 <名称> [等级]，如：招式表 皮卡丘 50")
-            return
-        row = self.db.pokemon(keyword)
+    async def _learnset_view(self, event: AstrMessageEvent, name: str, level: str):
+        """「宝可梦 <名> 招式表 …」子视图：可学招式与推荐配招。"""
+        row = self.db.pokemon(name)
         if not row:
-            yield event.plain_result(f"没有查到「{keyword}」的相关信息")
+            yield event.plain_result(f"没有查到「{name}」的相关信息")
             return
         level_i = self._parse_clamped_int(level, 0, 0, 100) or None
         yield event.plain_result(self._learnset_text(row, level_i))
@@ -537,6 +593,29 @@ class PokedexPlugin(Star):
             level=level,
         )
 
+    def _champ_ranks_line(self, rows: list[dict]) -> str:
+        """ "冠军赛排名（M-7）：A 单#1/双#1｜B 单#7/双#5"，无数据返回空串。"""
+        if not self.champions.exists:
+            return ""
+        season = self.champions.latest_season("single")
+        if not season:
+            return ""
+        parts = []
+        for row in rows:
+            name = row.get("name_zh", "")
+            if not name:
+                continue
+            ranks = {
+                r["format"]: r["rank"]
+                for r in self.champions.pokemon_ranks(name, season)
+            }
+            s = f"单#{ranks['single']}" if ranks.get("single") else "单—"
+            d = f"双#{ranks['double']}" if ranks.get("double") else "双—"
+            parts.append(f"{name} {s}/{d}")
+        if not parts:
+            return ""
+        return f"冠军赛排名（{season}）：" + "｜".join(parts)
+
     def _battle_text(self, row1: dict, row2: dict, level: int) -> str:
         sim = BattleSimulator(self.db.type_chart())
         report = sim.simulate(
@@ -546,6 +625,9 @@ class PokedexPlugin(Star):
             f"【{row1.get('name_zh', '')} vs {row2.get('name_zh', '')}】Lv.{level} 对战",
             "规则：简化规则（无特性/道具/天气/招式附加效果），配招为自动推荐",
         ]
+        champ_line = self._champ_ranks_line([row1, row2])
+        if champ_line:
+            lines.append(champ_line)
         if report["winner"] == "平局":
             lines.append(f"结果：平局（{report['turns']} 回合）")
         else:
@@ -586,6 +668,17 @@ class PokedexPlugin(Star):
         yield event.plain_result(self._battle_text(row1, row2, level_i))
 
     # ---------- Phase 4：队伍分析 / 种族值筛选 ----------
+    def _champ_rank_short(self, name: str) -> str:
+        """成员名次短标注「单#3/双#82」；查不到或无数据返回空串。"""
+        if not self.champions.exists:
+            return ""
+        ranks = {r["format"]: r["rank"] for r in self.champions.pokemon_ranks(name)}
+        if not ranks:
+            return ""
+        s = f"单#{ranks['single']}" if ranks.get("single") else "单—"
+        d = f"双#{ranks['double']}" if ranks.get("double") else "双—"
+        return f"{s}/{d}"
+
     def _team_text(self, result: dict) -> str:
         lines = [
             "【队伍分析】"
@@ -596,7 +689,9 @@ class PokedexPlugin(Star):
                 lines.append(f"? {m['keyword']}：{m['error']}")
                 continue
             weak = "、".join(f"{a}×{v:g}" for a, v in m["weak"]) or "无"
-            lines.append(f"{m['name']}（{m['types']}）：怕 {weak}")
+            champ = self._champ_rank_short(m["name"])
+            tag = f"［冠军赛 {champ}］" if champ else ""
+            lines.append(f"{m['name']}{tag}（{m['types']}）：怕 {weak}")
         if result["common_weaknesses"]:
             lines.append("⚠ 共同弱点（队伍整体需防范）：")
             lines += [
@@ -713,48 +808,460 @@ class PokedexPlugin(Star):
         )
         return "\n".join(lines)
 
-    @filter.command("搜索")
-    async def cmd_search(self, event: AstrMessageEvent, keyword: str = ""):
-        """跨表搜索名称"""
-        if not keyword:
-            yield event.plain_result("用法：搜索 <关键词>")
-            return
-        found = self.db.search(keyword)
-        if not found:
-            yield event.plain_result(f"没有查到「{keyword}」的相关信息")
-            return
-        lines = []
-        for table, rows in found.items():
-            for r in rows[:5]:
-                parts = [
-                    f"{r.get(c, '')}"
-                    for c in ("id_raw", "national_id", "name_zh", "name_en")
-                    if r.get(c)
-                ]
-                lines.append(f"[{TABLES[table]}] {' | '.join(parts)}")
-        yield event.plain_result("\n".join(lines[:15]))
+    # ---------- 冠军赛季数据（champions.db，只读查询） ----------
+    # 一个入口搞定全部查询，参数按 token 自动分类：
+    #   冠军                          → 数据状态 + 用法
+    #   冠军 单打 / 冠军 双打          → Top10（可再加赛季：M-6 / 6 / 上一轮）
+    #   冠军 3 / 冠军 双打 3           → 第3名是谁（附配置摘要）
+    #   冠军 烈咬陆鲨                  → 名次（单+双）+ 配置使用率
+    #   冠军 烈咬陆鲨 趋势             → 跨赛季名次变化
+    #   冠军 烈咬陆鲨 M-6             → 指定赛季（数字与名称同现时视为赛季）
+    #   冠军 生命宝珠                  → 道具反查（谁在带它）
+    #   冠军 数据                      → 本地库状态
+    CHAMP_FORMATS: ClassVar[dict[str, str]] = {
+        "单打": "single",
+        "双打": "double",
+        "single": "single",
+        "double": "double",
+    }
+    CHAMP_LATEST_WORDS: ClassVar[set[str]] = {
+        "最新",
+        "这赛季",
+        "本赛季",
+        "latest",
+        "this",
+    }
+    CHAMP_PREV_WORDS: ClassVar[set[str]] = {
+        "上一轮",
+        "上一赛季",
+        "上赛季",
+        "上个赛季",
+        "上季",
+        "prev",
+        "previous",
+    }
+    CHAMP_SEASON_RE: ClassVar[re.Pattern[str]] = re.compile(
+        r"(?:m-?|第)?(\d{1,3})(?:赛季?)?", re.IGNORECASE
+    )
 
-    @filter.command("宝可梦帮助")
-    async def cmd_help(self, event: AstrMessageEvent):
-        """查看宝可梦插件帮助"""
+    @classmethod
+    def _parse_champ_args(cls, text: str) -> dict:
+        """把指令参数按 token 分类。
+
+        数字语义消歧：与名称词同现时视为赛季编号（冠军 烈咬陆鲨 6 → M-6），
+        否则首个数字是名次（冠军 3 → 第3名）、第二个数字是赛季。
+        返回 {fmt, rank, season, view, names}；season 取值 None(最新)/"prev"/"M-N"。
+        """
+        fmt = rank = view = None
+        season: str | None = None
+        names: list[str] = []
+        digits: list[int] = []
+        for raw in (text or "").split():
+            t = raw.strip()
+            low = t.lower()
+            if low in cls.CHAMP_FORMATS and fmt is None:
+                fmt = cls.CHAMP_FORMATS[low]
+            elif low in {"趋势", "trend"}:
+                view = "trend"
+            elif low in {"帮助", "help", "用法"}:
+                view = "help"
+            elif low in {"数据", "状态", "status"}:
+                view = "status"
+            elif low in cls.CHAMP_LATEST_WORDS:
+                season = None
+            elif low in cls.CHAMP_PREV_WORDS:
+                season = "prev"
+            elif low.startswith(("m", "第")) or low.endswith("赛季"):
+                m = cls.CHAMP_SEASON_RE.fullmatch(low)
+                if m:
+                    season = f"M-{m.group(1)}"
+                else:
+                    names.append(t)
+            elif t.lstrip("#").isdigit() and len(t.lstrip("#")) <= 3:
+                digits.append(int(t.lstrip("#")))
+            else:
+                names.append(t)
+        if names:  # 有名称词：数字是赛季
+            if digits:
+                season = f"M-{digits.pop(0)}"
+        elif digits:  # 无名称词：首个数字是名次，其余是赛季
+            rank = digits.pop(0)
+            if digits:
+                season = f"M-{digits.pop(0)}"
+        return {
+            "fmt": fmt,
+            "rank": rank,
+            "season": season,
+            "view": view,
+            "names": names,
+        }
+
+    def _champ_season_real(self, season: str | None, fmt: str) -> str | None:
+        """把 None/"prev"/"M-N"/"6" 解析为库里真实赛季；prev 只有一个赛季时 None。"""
+        if season == "prev":
+            seasons = self.champions.seasons(fmt)
+            return seasons[1] if len(seasons) > 1 else None
+        s = (season or "").strip()
+        if s.isdigit():
+            s = f"M-{s}"
+        return self.champions.resolve_season(s or None, fmt)
+
+    @staticmethod
+    def _champ_format_arg(fmt: str) -> str:
+        """LLM 工具的 fmt 参数（single/double）→ 内部格式。"""
+        return "double" if (fmt or "").strip().lower() == "double" else "single"
+
+    def _champ_updated_line(
+        self, season: str | None, source: str = "pokechamdb"
+    ) -> str:
+        """ "本地数据更新：…（站点更新：…）" 行，跨格式查询复用。"""
+        st = self.champions.status(source=source, season=season)
+        if not st:
+            return ""
+        local = ""
+        try:
+            from datetime import datetime
+
+            dt = datetime.fromisoformat(st["run_at"])
+            local = dt.astimezone().strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            pass
+        site = st.get("source_updated_at") or "站点时间未知"
+        return f"本地数据更新：{local or st.get('run_at', '?')}（站点更新：{site}）"
+
+    def _champ_header(
+        self, fmt: str, season: str | None, source: str = "pokechamdb"
+    ) -> str:
+        """查询结果头部：赛季/格式 + 数据来源 + 本地数据更新日期。"""
+        season = self.champions.resolve_season(season, fmt, source)
+        lines = [
+            (
+                f"【宝可梦 Champions {season or '?'} {fmt_label(fmt)}】"
+                f"来源：{source_label(source)}"
+            )
+        ]
+        updated = self._champ_updated_line(season, source)
+        if updated:
+            lines.append(updated)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _champ_ev_text(value: str) -> str:
+        """ "2-32-0-0-0-32" → "HP2/攻32/防0/特攻0/特防0/速32"。"""
+        keys = ("HP", "攻", "防", "特攻", "特防", "速")
+        parts = value.split("-")
+        if len(parts) != 6:
+            return value
+        return "/".join(f"{k}{v}" for k, v in zip(keys, parts))
+
+    def _champ_no_data(self) -> str:
+        return (
+            "本地还没有冠军赛数据。\n"
+            "请在插件目录运行独立抓取脚本：uv run python champions_fetch.py"
+            "（详见 README「冠军赛季数据」一节）"
+        )
+
+    def _champ_option_line(
+        self, pokemon_id: str, fmt: str, season: str | None, otype: str, top_n: int
+    ) -> str | None:
+        """某类配置的一行摘要（名称 使用率%），无数据返回 None。"""
+        opts = self.champions.pokemon_options(
+            pokemon_id, fmt, season, option_type=otype, top_n=top_n
+        )
+        if not opts:
+            return None
+        parts = []
+        for o in opts:
+            if otype == "teammate":
+                parts.append(f"{o['option_value']}(#{o['rank']})")
+            elif otype == "ev_spread":
+                pct = f" {o['usage_pct']:g}%" if o.get("usage_pct") is not None else ""
+                parts.append(f"{self._champ_ev_text(o['option_value'])}{pct}")
+            else:
+                pct = f" {o['usage_pct']:g}%" if o.get("usage_pct") is not None else ""
+                parts.append(f"{o['option_value']}{pct}")
+        return f"{OPTION_LABELS.get(otype, otype)}：{'、'.join(parts)}"
+
+    def _champ_ranking_text(
+        self, fmt: str, season: str | None, limit: int | None = None
+    ) -> str:
+        """排名 TopN 文本。"""
+        limit = limit or max(1, min(50, int(self.config.get("champions_top_n", 10))))
+        rows = self.champions.top_usage(fmt, season, limit=limit)
+        if not rows:
+            season_real = self.champions.resolve_season(season, fmt)
+            return (
+                f"本地没有 {fmt_label(fmt)} {season_real or ''} 的排名数据，"
+                f"可用赛季：{'、'.join(self.champions.seasons(fmt)) or '无'}"
+            )
+        lines = [self._champ_header(fmt, season), ""]
+        for r in rows:
+            pct = f"{r['usage_pct']:g}%" if r.get("usage_pct") is not None else ""
+            lines.append(
+                f"#{r['rank']:<3} {r['name_zh'] or r['pokemon_id']} {pct}".rstrip()
+            )
+        if rows[0].get("usage_pct") is None:
+            lines.append("（该来源仅提供名次，无使用率百分比）")
+        lines.append("提示：冠军 3 = 第3名是谁｜冠军 <宝可梦> = 名次+配置")
+        return "\n".join(lines)
+
+    def _champ_rank_row_text(self, fmt: str, row: dict) -> str:
+        """「第 N 名是谁」：名次 + 宝可梦 + 招式/道具摘要 + 反查提示。"""
+        season = row.get("season") or self.champions.resolve_season(None, fmt)
+        lines = [
+            (
+                f"【宝可梦 Champions {season or '?'} {fmt_label(fmt)} "
+                f"第 {row['rank']} 名】来源：{source_label('pokechamdb')}"
+            ),
+            self._champ_updated_line(season),
+            (
+                f"#{row['rank']} {row['name_zh'] or row['pokemon_id']}"
+                f"（共 {row.get('total', '?')} 只）"
+            ),
+        ]
+        for otype, top_n in (("move", 3), ("item", 2)):
+            line = self._champ_option_line(row["pokemon_id"], fmt, season, otype, top_n)
+            if line:
+                lines.append(line)
+        lines.append(
+            f"提示：冠军 {row['name_zh'] or row['pokemon_id']} = 完整配置与单双打名次"
+        )
+        return "\n".join(line for line in lines if line)
+
+    def _champ_pokemon_card_text(
+        self, prow: dict, fmt_req: str | None, season_real: str | None
+    ) -> str:
+        """宝可梦卡片：名次（未指定格式则单双都给）+ 配置使用率 + 反查提示。"""
+        pid = prow["pokemon_id"]
+        name = prow.get("name_zh") or pid
+        fmt_show = fmt_req or "single"
+        fmts = [fmt_req] if fmt_req else ["single", "double"]
+        lines = [
+            (
+                f"【{name} 冠军赛配置】赛季 {season_real or '?'}｜"
+                f"来源：{source_label('pokechamdb')}"
+            )
+        ]
+        updated = self._champ_updated_line(season_real)
+        if updated:
+            lines.append(updated)
+        for fmt in fmts:
+            row = (
+                prow
+                if fmt == fmt_show
+                else self.champions.resolve_pokemon(pid, fmt, season_real)
+            )
+            if not row:
+                lines.append(f"{fmt_label(fmt)}：榜单未收录")
+                continue
+            pct = (
+                f"，使用率 {row['usage_pct']:g}%"
+                if row.get("usage_pct") is not None
+                else ""
+            )
+            lines.append(
+                f"{fmt_label(fmt)}：#{row['rank']}（共 "
+                f"{self.champions.count(fmt, row['season'])} 只）{pct}"
+            )
+            for otype, top_n in (
+                ("move", 4),
+                ("item", 3),
+                ("ability", 2),
+                ("nature", 2),
+                ("ev_spread", 2),
+                ("teammate", 3),
+                ("tera", 2),
+            ):
+                line = self._champ_option_line(pid, fmt, row["season"], otype, top_n)
+                if line:
+                    lines.append(("　" if len(fmts) > 1 else "") + line)
+        other = next(f for f in ("single", "double") if f != fmt_show)
+        lines.append(
+            f"提示：冠军 {name} 趋势 = 跨赛季｜冠军 {name} "
+            f"{fmt_label(other)} = 另一格式"
+        )
+        return "\n".join(line for line in lines if line)
+
+    def _champ_trend_text(self, prow: dict, fmt_req: str | None) -> str:
+        """跨赛季名次（未指定格式则单双并列）。"""
+        pid = prow["pokemon_id"]
+        name = prow.get("name_zh") or pid
+        fmts = [fmt_req] if fmt_req else ["single", "double"]
+        lines = [f"【{name} 跨赛季名次】来源：{source_label('pokechamdb')}"]
+        any_row = False
+        for fmt in fmts:
+            rows = self.champions.trend(pid, fmt)
+            if not rows:
+                continue
+            any_row = True
+            body = "｜".join(f"{r['season']} #{r['rank']}" for r in rows)
+            lines.append(f"{fmt_label(fmt)}：{body}")
+        if not any_row:
+            lines.append("本地只有一个赛季的数据，暂无趋势（多抓几个赛季后再试）")
+        else:
+            lines.append("提示：冠军 <宝可梦> = 当前赛季完整配置")
+        return "\n".join(lines)
+
+    def _champ_item_text(
+        self, item: str, rows: list[dict], fmt: str, season_real: str | None
+    ) -> str:
+        """道具反查：谁在带它。"""
+        lines = [
+            (
+                f"【{fmt_label(fmt)} {season_real or '?'} 携带「{rows[0]['item']}」】"
+                f"来源：{source_label('pokechamdb')}"
+            ),
+            self._champ_updated_line(season_real),
+        ]
+        for r in rows[:10]:
+            pct = (
+                f" {r['item_usage_pct']:g}%"
+                if r.get("item_usage_pct") is not None
+                else ""
+            )
+            lines.append(f"#{r['rank']} {r['name_zh'] or r['pokemon_id']}{pct}")
+        lines.append("提示：冠军 <宝可梦名> = 它的完整配置")
+        return "\n".join(line for line in lines if line)
+
+    def _champ_status_text(self) -> str:
+        """本地库状态。"""
+        info = self.champions.database_summary()
+        if not info.get("exists"):
+            return self._champ_no_data()
+        lines = ["【冠军赛本地数据】"]
+        for fmt in ("single", "double"):
+            seasons = self.champions.seasons(fmt)
+            if not seasons:
+                continue
+            latest = seasons[0]
+            n = len(self.champions.top_usage(fmt, latest, limit=1000))
+            st = self.champions.status(fmt=fmt, season=latest)
+            when = ""
+            if st:
+                try:
+                    from datetime import datetime
+
+                    when = (
+                        datetime.fromisoformat(st["run_at"])
+                        .astimezone()
+                        .strftime("%Y-%m-%d %H:%M")
+                    )
+                except (ValueError, TypeError):
+                    pass
+            src = f"，来源 {source_label(st['source'])}" if st else ""
+            lines.append(
+                f"{fmt_label(fmt)} {'、'.join(seasons[:3])}：{n} 只"
+                + (f"，本地更新 {when}{src}" if when else "")
+            )
+        if len(lines) == 1:
+            lines.append("数据库为空，请先运行抓取脚本")
+        lines.append(f"库文件：{info['path']}")
+        return "\n".join(lines)
+
+    def _champ_help_text(self) -> str:
+        st_line = ""
+        latest = self.champions.latest_season("single")
+        if latest:
+            st_line = f"当前本地赛季：{latest}（冠军 数据 看详情）\n"
+        return (
+            "【冠军赛查询】\n" + st_line + "冠军 单打 / 冠军 双打 — Top10\n"
+            "冠军 3 / 冠军 双打 3 — 第3名是谁\n"
+            "冠军 <宝可梦> — 名次(单双) + 配置使用率\n"
+            "冠军 <宝可梦> 趋势 — 跨赛季名次\n"
+            "冠军 <道具名> — 谁在带这个道具\n"
+            "赛季：默认最新，可加 M-6 / 6 / 上一轮\n"
+            "对战 <A> <B> 结果里也会带双方名次"
+        )
+
+    @filter.command("冠军")
+    async def cmd_champion(self, event: AstrMessageEvent, keyword: str = ""):
+        """冠军赛一站式查询：冠军 帮助 看用法"""
+        if not self.champions.exists:
+            yield event.plain_result(self._champ_no_data())
+            return
+        args = self._parse_champ_args(keyword)
+        fmt, rank, season, view, names = (
+            args["fmt"],
+            args["rank"],
+            args["season"],
+            args["view"],
+            args["names"],
+        )
+        if view == "status":
+            yield event.plain_result(self._champ_status_text())
+            return
+        if view == "help" or (
+            not names
+            and rank is None
+            and fmt is None
+            and view is None
+            and season is None
+        ):
+            yield event.plain_result(self._champ_help_text())
+            return
+        fmt_eff = fmt or self.config.get("champions_default_format", "single")
+        season_real = self._champ_season_real(season, fmt_eff)
+        if season == "prev" and season_real is None:
+            latest = self.champions.latest_season(fmt_eff)
+            yield event.plain_result(f"本地只有 {latest or '?'} 一个赛季，无法查上一轮")
+            return
+
+        # ---- 无名称：排名 / 按名次 ----
+        if not names:
+            if rank is not None:
+                row = self.champions.by_rank(rank, fmt_eff, season_real)
+                if not row:
+                    yield event.plain_result(
+                        f"{fmt_label(fmt_eff)} {season_real or ''} 榜单没有第 {rank} 名"
+                    )
+                else:
+                    yield event.plain_result(self._champ_rank_row_text(fmt_eff, row))
+            else:
+                yield event.plain_result(self._champ_ranking_text(fmt_eff, season_real))
+            return
+
+        # ---- 有名称：趋势 / 宝可梦卡片 / 道具反查 ----
+        name = names[0]
+        if view == "trend":
+            prow = self.champions.resolve_pokemon(name, fmt_eff, season_real)
+            if not prow:
+                yield event.plain_result(
+                    f"{fmt_label(fmt_eff)} {season_real or ''} 榜单中没有「{name}」"
+                )
+            else:
+                yield event.plain_result(self._champ_trend_text(prow, fmt))
+            return
+        prow = self.champions.resolve_pokemon(name, fmt_eff, season_real)
+        if prow:
+            yield event.plain_result(
+                self._champ_pokemon_card_text(prow, fmt, season_real)
+            )
+            return
+        rows = self.champions.find_pokemon_by_item(name, fmt_eff, season_real)
+        if rows:
+            yield event.plain_result(
+                self._champ_item_text(name, rows, fmt_eff, season_real)
+            )
+            return
         yield event.plain_result(
+            f"「{name}」既不在 {fmt_label(fmt_eff)} 榜单也没有道具匹配；"
+            f"发「冠军 帮助」看用法"
+        )
+
+    def _help_text(self) -> str:
+        return (
             "🎮 宝可梦图鉴插件\n"
-            "宝可梦 <编号/名称> — 图鉴详情（图片卡片）\n"
-            "特性 <名称> — 特性效果与持有者\n"
-            "招式 <名称> — 招式数据\n"
-            "道具 <名称> — 道具说明\n"
-            "图鉴 <编号/地区> — 地区图鉴定位\n"
-            "相性 <属性1> [属性2] — 属性相性（防守方向）\n"
-            "克制 <属性> — 属性进攻相性（打谁效果拔群）\n"
-            "能力值 <名称> [等级] [个体] [性格] — 等级能力值计算\n"
-            "对比 <名称1> <名称2> — 两只宝可梦对比\n"
-            "怎么打 <名称> — 推荐克制它的宝可梦\n"
-            "招式表 <名称> [等级] — 可学招式与推荐配招\n"
-            "对战 <名称1> <名称2> [等级] — 模拟对战（简化规则）\n"
+            "宝可梦 <编号/名称> — 图鉴卡片（头部带冠军赛名次）\n"
+            "宝可梦 <名称> 招式表 [等级] — 可学招式与推荐配招\n"
+            "宝可梦 <名称> 能力值 [等级 个体 性格] — 等级能力值计算\n"
+            "特性 <名称> / 招式 <名称> / 道具 <名称> — 数据查询\n"
+            "相性 <属性1> [属性2] / 相性 打 <属性> — 属性相性防守/进攻\n"
+            "克制 <宝可梦> / 克制 <A> <B> — 克制推荐与多维度对比\n"
+            "对战 <名称1> <名称2> [等级] — 模拟对战（含双方冠军赛名次）\n"
             "队伍分析 <名称...> — 队伍弱点配置分析\n"
             "筛选 <条件> — 按种族值筛选，如 速度>100 特攻>=120\n"
             "许愿星 <性格> [个体下限] [TID SID] — 许愿星基拉祈目标筛选\n"
-            "搜索 <关键词> — 跨表搜索\n"
+            "冠军 <关键词> — 冠军赛一站式查询，冠军 帮助 看用法\n"
             "群聊 @我 直接提问时也会自动调用图鉴工具（需模型支持函数调用）"
         )
 
@@ -792,6 +1299,18 @@ class PokedexPlugin(Star):
         out = []
         for table, rows in found.items():
             for r in rows[:5]:
+                if table == "pokedex":
+                    if r.get("dex") == "national":
+                        out.append(
+                            f"[地区图鉴] 全国 {r.get('id_raw', '')}："
+                            f"{r.get('name', '')}（{r.get('types', '')}）"
+                        )
+                    else:
+                        out.append(
+                            f"[{r.get('dex', '')}图鉴] {r.get('id_raw', '')}"
+                            f"（全国 {r.get('national_id', '')}）：{r.get('name', '')}"
+                        )
+                    continue
                 parts = [
                     f"{r.get(c, '')}"
                     for c in ("id_raw", "national_id", "name_zh", "name_en")
@@ -856,6 +1375,21 @@ class PokedexPlugin(Star):
                 "description",
                 "additional_effect",
             ),
+        )
+
+    @filter.llm_tool(name="query_item")
+    async def tool_query_item(self, event: AstrMessageEvent, keyword: str):
+        """查询道具（携带物品）的类别与说明。返回中文数据，直接引用即可。
+        Args:
+            keyword(str): 道具名称（中文或英文，支持片段）
+        """
+        rows = self.db.query("item", keyword)
+        if not rows:
+            return f"没有查到道具「{keyword}」的相关信息"
+        r = rows[0]
+        return (
+            f"道具 {r.get('name_zh', '')}（{r.get('name_en', '')}）\n"
+            f"类别：{r.get('category_path', '')}\n说明：{r.get('description', '')}"
         )
 
     @filter.llm_tool(name="query_dex_region")
@@ -940,6 +1474,268 @@ class PokedexPlugin(Star):
         if not count:
             return "没有符合条件的目标，请放宽个体值下限或核对性格/属性名称"
         return self._format_wishmaker(nature, iv_floor, count, rows)
+
+    # ---------- 冠军赛季 LLM 工具 ----------
+    @filter.llm_tool(name="query_champions_ranking")
+    async def tool_champ_ranking(
+        self,
+        event: AstrMessageEvent,
+        fmt: str = "single",
+        season: str = "",
+        limit: int = 10,
+    ):
+        """查询宝可梦 Champions 冠军赛使用率排名（本地离线数据）。
+        返回前 N 名及数据来源与本地更新日期。适用于"当前单打使用率排名""双打什么强"。
+        Args:
+            fmt(str): 格式，single=单打 / double=双打，默认 single
+            season(str): 赛季，M-7、6 或 "上一轮" 均可，留空用本地最新赛季
+            limit(int): 返回数量（1-20），默认 10
+        """
+        if not self.champions.exists:
+            return self._champ_no_data()
+        f = self._champ_format_arg(fmt)
+        rows = self.champions.top_usage(
+            f, self._champ_season_real(season, f), limit=max(1, min(20, int(limit)))
+        )
+        if not rows:
+            return (
+                f"本地没有 {fmt_label(f)} 的排名数据"
+                f"（可用赛季：{'、'.join(self.champions.seasons(f)) or '无'}）"
+            )
+        lines = [self._champ_header(f, self._champ_season_real(season, f))]
+        for r in rows:
+            pct = f"{r['usage_pct']:g}%" if r.get("usage_pct") is not None else ""
+            lines.append(
+                f"#{r['rank']} {r['name_zh'] or r['pokemon_id']} {pct}".rstrip()
+            )
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="query_rank_pokemon")
+    async def tool_rank_pokemon(
+        self,
+        event: AstrMessageEvent,
+        rank: int,
+        fmt: str = "single",
+        season: str = "",
+    ):
+        """按名次反查冠军赛宝可梦：返回该名次的宝可梦与配置摘要（本地离线数据）。
+        适用于"单打第3名是谁""双打第5名用什么"；查某宝可梦的名次用 query_pokemon_rank。
+        Args:
+            rank(int): 名次（如 3 表示第 3 名）
+            fmt(str): single=单打 / double=双打，默认 single
+            season(str): 赛季，M-7、6 或 "上一轮" 均可，留空用本地最新赛季
+        """
+        if not self.champions.exists:
+            return self._champ_no_data()
+        f = self._champ_format_arg(fmt)
+        season_real = self._champ_season_real(season, f)
+        row = self.champions.by_rank(int(rank), f, season_real)
+        if not row:
+            return f"{fmt_label(f)} {season_real or ''} 榜单没有第 {rank} 名"
+        return self._champ_rank_row_text(f, row)
+
+    @filter.llm_tool(name="query_pokemon_rank")
+    async def tool_champ_lookup(
+        self, event: AstrMessageEvent, keyword: str, season: str = ""
+    ):
+        """查询某只宝可梦在冠军赛单打和双打的排名（本地离线数据）。
+        适用于"烈咬陆鲨排第几""谜拟Ｑ双打排名多少"；按名次反查宝可梦用 query_rank_pokemon。
+        Args:
+            keyword(str): 宝可梦名称（如 烈咬陆鲨）
+            season(str): 赛季，M-7、6 或 "上一轮" 均可，留空用本地最新赛季
+        """
+        if not self.champions.exists:
+            return self._champ_no_data()
+        kw = (keyword or "").strip().lstrip("#")
+        rows = self.champions.pokemon_ranks(
+            kw, self._champ_season_real(season, "single")
+        )
+        if not rows:
+            season_real = self._champ_season_real(season, "single")
+            return f"{season_real or ''} 冠军赛榜单中没有「{keyword}」"
+        lines = [
+            (
+                f"【{rows[0]['name_zh'] or rows[0]['pokemon_id']} 冠军赛排名】"
+                f"赛季 {rows[0]['season']}｜来源：{source_label('pokechamdb')}"
+            ),
+            self._champ_updated_line(rows[0]["season"]),
+        ]
+        for r in rows:
+            pct = (
+                f"，使用率 {r['usage_pct']:g}%"
+                if r.get("usage_pct") is not None
+                else ""
+            )
+            lines.append(
+                f"{fmt_label(r['format'])}：#{r['rank']}（共 {r['total']} 只）{pct}"
+            )
+        missing = {"single", "double"} - {r["format"] for r in rows}
+        if missing:
+            lines.append(
+                f"{'、'.join(fmt_label(m) for m in sorted(missing))}榜单中未收录该宝可梦"
+            )
+        return "\n".join(line for line in lines if line)
+
+    @filter.llm_tool(name="query_champions_build")
+    async def tool_champ_build(
+        self,
+        event: AstrMessageEvent,
+        keyword: str,
+        fmt: str = "single",
+        season: str = "",
+    ):
+        """查询宝可梦在冠军赛的主流配置使用率：招式、道具、特性、性格、能力点、队友
+        （本地离线数据，仅单打有配置明细）。适用于"烈咬陆鲨冠军赛怎么配""耿鬼带什么招"。
+        Args:
+            keyword(str): 宝可梦名称（中文名优先，如 烈咬陆鲨）
+            fmt(str): 格式，single=单打 / double=双打，默认 single
+            season(str): 赛季，M-7、6 或 "上一轮" 均可，留空用本地最新赛季
+        """
+        if not self.champions.exists:
+            return self._champ_no_data()
+        f = self._champ_format_arg(fmt)
+        row = self.champions.resolve_pokemon(
+            keyword, f, self._champ_season_real(season, f)
+        )
+        if not row:
+            return (
+                f"{fmt_label(f)} {self._champ_season_real(season, f) or ''} "
+                f"榜单中没有「{keyword}」"
+            )
+        lines = [self._champ_header(f, self._champ_season_real(season, f))]
+        rank_pct = f"（#{row['rank']}" + (
+            f"，使用率 {row['usage_pct']:g}%）"
+            if row.get("usage_pct") is not None
+            else "）"
+        )
+        lines.append(f"{row['name_zh'] or row['pokemon_id']} {rank_pct}")
+        for otype in self.champions.option_types(
+            row["pokemon_id"], f, self._champ_season_real(season, f)
+        ):
+            opts = self.champions.pokemon_options(
+                row["pokemon_id"],
+                f,
+                self._champ_season_real(season, f),
+                option_type=otype,
+                top_n=3 if otype == "teammate" else 5,
+            )
+            label = OPTION_LABELS.get(otype, otype)
+            parts = []
+            for o in opts:
+                pct = (
+                    f"{o['usage_pct']:g}%"
+                    if o.get("usage_pct") is not None
+                    else (f"(#{o['rank']})" if o.get("rank") is not None else "")
+                )
+                if otype == "ev_spread":
+                    parts.append(
+                        f"{self._champ_ev_text(o['option_value'])} {pct}".strip()
+                    )
+                else:
+                    parts.append(f"{o['option_value']}{pct}")
+            if parts:
+                lines.append(f"{label}：{'、'.join(parts)}")
+        if len(lines) <= 2:
+            lines.append("（该宝可梦暂无配置明细；双打格式站点不提供明细）")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="find_champions_by_item")
+    async def tool_champ_item(
+        self,
+        event: AstrMessageEvent,
+        item_name: str,
+        fmt: str = "single",
+        season: str = "",
+    ):
+        """反查冠军赛中携带某道具的宝可梦及携带率（本地离线数据）。
+        适用于"谁带讲究围巾""生命宝珠使用者排名"。
+        Args:
+            item_name(str): 道具名称（支持片段，如 围巾、宝珠）
+            fmt(str): 格式，single=单打 / double=双打，默认 single
+            season(str): 赛季，M-7、6 或 "上一轮" 均可，留空用本地最新赛季
+        """
+        if not self.champions.exists:
+            return self._champ_no_data()
+        f = self._champ_format_arg(fmt)
+        rows = self.champions.find_pokemon_by_item(
+            item_name, f, self._champ_season_real(season, f)
+        )
+        if not rows:
+            return f"{fmt_label(f)} 没有宝可梦携带含「{item_name}」的道具"
+        lines = [
+            self._champ_header(f, self._champ_season_real(season, f)),
+            f"携带「{rows[0]['item']}」的宝可梦：",
+        ]
+        for r in rows:
+            pct = (
+                f"{r['item_usage_pct']:g}%"
+                if r.get("item_usage_pct") is not None
+                else ""
+            )
+            lines.append(
+                f"#{r['rank']} {r['name_zh'] or r['pokemon_id']}（道具 {pct}）".rstrip()
+            )
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="query_champions_trend")
+    async def tool_champ_trend(
+        self,
+        event: AstrMessageEvent,
+        keyword: str,
+        fmt: str = "single",
+    ):
+        """查询宝可梦在冠军赛的跨赛季排名变化（本地离线数据）。
+        适用于"烈咬陆鲨这几赛季排名怎么样""某宝可梦热度变化"。
+        Args:
+            keyword(str): 宝可梦名称（中文名优先）
+            fmt(str): 格式，single=单打 / double=双打，默认 single
+        """
+        if not self.champions.exists:
+            return self._champ_no_data()
+        f = self._champ_format_arg(fmt)
+        row = self.champions.resolve_pokemon(keyword, f)
+        if not row:
+            return f"冠军赛数据中没有「{keyword}」"
+        rows = self.champions.trend(row["pokemon_id"], f)
+        if not rows:
+            return "本地只有一个赛季的数据，暂无趋势可查（运行抓取脚本时多抓几个赛季）"
+        lines = [f"【{row['name_zh'] or row['pokemon_id']} 跨赛季排名】{fmt_label(f)}"]
+        for r in rows:
+            pct = (
+                f"，使用率 {r['usage_pct']:g}%"
+                if r.get("usage_pct") is not None
+                else ""
+            )
+            lines.append(f"{r['season']}：#{r['rank']}{pct}")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="champions_data_status")
+    async def tool_champ_status(self, event: AstrMessageEvent):
+        """查看本地冠军赛数据库状态：覆盖的赛季/格式、条目数与最后更新时间。
+        用户询问冠军赛数据是否最新、数据来自哪里时使用。
+        """
+        info = self.champions.database_summary()
+        if not info.get("exists"):
+            return self._champ_no_data()
+        lines = ["【冠军赛本地数据】"]
+        for fmt in ("single", "double"):
+            seasons = self.champions.seasons(fmt)
+            if not seasons:
+                continue
+            latest = seasons[0]
+            n = len(self.champions.top_usage(fmt, latest, limit=1000))
+            st = self.champions.status(fmt=fmt, season=latest)
+            if st:
+                lines.append(
+                    f"{fmt_label(fmt)} {latest}：{n} 只，"
+                    f"来源 {source_label(st['source'])}，"
+                    f"站点更新 {st.get('source_updated_at') or '?'}"
+                )
+            else:
+                lines.append(f"{fmt_label(fmt)} {latest}：{n} 只")
+        if len(lines) == 1:
+            lines.append("数据库为空")
+        return "\n".join(lines)
 
     @filter.llm_tool(name="find_pokemon_by_type")
     async def tool_find_by_type(self, event: AstrMessageEvent, type_name: str):

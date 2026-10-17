@@ -3,7 +3,6 @@
 
 import io
 import re
-import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -529,6 +528,7 @@ class CardRenderer:
         evo_chain: list | None = None,
         shiny_image: Image.Image | None = None,
         ability_immune: list[tuple[str, str]] | None = None,
+        champion: dict | None = None,
     ) -> bytes:
         W, PAD = 1080, 44
         name_font, mid_font, small_font, badge_font = (
@@ -658,7 +658,8 @@ class CardRenderer:
                     )
                 )
 
-        # 双栏高度与整卡高度预算
+        # 双栏高度与整卡高度预算（冠军赛名次条占 52px）
+        champ_h = 52 if champion else 0
         left_h = art_img.height if art_img is not None else 0
         if shine_img is not None:
             left_h += (12 if left_h else 0) + shine_img.height + 26  # 含"闪光"标注
@@ -667,7 +668,7 @@ class CardRenderer:
             right_h += 40  # 形态总和摘要行
         right_h += len(stats) * 52 + (52 if total else 0) + 8
 
-        y = PAD + 120  # 头部（名字/副标题/属性徽章）
+        y = PAD + 120 + champ_h  # 头部（名字/副标题/属性徽章）+ 冠军赛条
         y += max(left_h, right_h)  # 双栏内容
         y += 60  # 分隔线
         y += 18 + sum(58 * len(lines) for _, lines in matchup_rows)  # 弱点/抗性（全宽）
@@ -718,6 +719,23 @@ class CardRenderer:
                     draw, (bx, by), t, TYPE_COLORS.get(t, (120, 120, 120)), badge_font
                 )
         y = PAD + 120
+        # 冠军赛名次条：标签 + 单/双打名次徽章 + 赛季与榜单规模
+        if champion:
+            cy = PAD + 116
+            draw.text((PAD, cy + 6), "冠军赛", font=small_font, fill=SUBTEXT)
+            bx = PAD + 90
+            for label, key, color in (
+                ("单打", "single", (79, 70, 229)),
+                ("双打", "double", (219, 39, 119)),
+            ):
+                rank = champion.get(key)
+                if not rank:
+                    continue
+                bx = self._badge(draw, (bx, cy), f"{label} #{rank}", color, badge_font)
+            note = f"{champion.get('season', '')} · 共 {champion.get('total', '?')} 只"
+            nw = draw.textlength(note, font=small_font)
+            draw.text((W - PAD - nw, cy + 6), note, font=small_font, fill=SUBTEXT)
+        y += champ_h  # 名次条占位，双栏从其下开始
         cols_top = y
 
         # 左列：立绘 → 闪光
@@ -829,7 +847,11 @@ class CardRenderer:
         return buf.getvalue()
 
     async def render_pokemon(
-        self, row: dict, db, image_bytes: bytes | None = None
+        self,
+        row: dict,
+        db,
+        image_bytes: bytes | None = None,
+        champion: dict | None = None,
     ) -> bytes | None:
         """组装种族值与进化链立绘并渲染卡片；失败返回 None（调用方回退文本）。"""
         try:
@@ -863,6 +885,7 @@ class CardRenderer:
                 evo_chain,
                 shiny,
                 db.ability_immunities(row),
+                champion,
             )
         except Exception as e:
             logger.warning(f"卡片渲染失败: {e}")

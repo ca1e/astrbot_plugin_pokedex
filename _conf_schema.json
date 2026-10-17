@@ -33,5 +33,23 @@
     "description": "PokéAPI 请求超时（秒）",
     "type": "int",
     "default": 15
+  },
+  "champions_db_path": {
+    "description": "冠军赛数据库路径",
+    "type": "string",
+    "default": "",
+    "hint": "champions.db 的路径。留空则使用 AstrBot 数据目录 data/plugin_data/astrbot_plugin_pokedex/champions.db（与抓取脚本默认一致）。"
+  },
+  "champions_default_format": {
+    "description": "冠军赛默认对战格式",
+    "type": "string",
+    "default": "single",
+    "hint": "冠军排名/冠军配置等指令未指定格式时使用：single=单打（默认），double=双打。"
+  },
+  "champions_top_n": {
+    "description": "冠军排名默认条数",
+    "type": "int",
+    "default": 10,
+    "hint": "「冠军排名」指令默认返回的排名条数（1-50）。"
   }
 }

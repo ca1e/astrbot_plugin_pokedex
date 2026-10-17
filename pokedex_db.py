@@ -30,9 +30,9 @@ TABLES = {
     "types": "types.tsv",
     "wishmaker": "wishmaker.tsv",
 }
-SEARCH_TABLES = ["simple", "pokemon", "ability", "move", "item"]
+SEARCH_TABLES = ["simple", "pokemon", "ability", "move", "item", "pokedex"]
 ID_COLS = ("id", "id_raw", "national_id")
-NAME_COLS = ("name_zh", "name_ja", "name_jp", "name_en", "name", "form_name")
+NAME_COLS = ("name_zh", "name_ja", "name_jp", "name_en", "name", "form_name", "dex")
 SUMMARY_COLS = (
     "id",
     "id_raw",

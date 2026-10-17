@@ -1,0 +1,6 @@
+# ---------------------------------------------------------------------------
+# 仅抓取脚本 champions_fetch.py 需要（插件运行时不需要）
+#   uv pip install -r requirements-scraper.txt
+#   uv run playwright install chromium
+# ---------------------------------------------------------------------------
+playwright>=1.48.0

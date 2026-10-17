@@ -153,7 +153,7 @@ def test_phase1_compare_data():
 def test_main_imports():
     section("main.py 导入与 llm_tool 注册（stub astrbot）")
 
-    registered = {"commands": [], "tools": [], "tool_funcs": []}
+    registered = {"commands": [], "aliases": [], "tools": [], "tool_funcs": []}
 
     def _mod(name, **attrs):
         m = types.ModuleType(name)
@@ -165,9 +165,10 @@ def test_main_imports():
     class _Dummy:
         pass
 
-    def _command(name, **kw):
+    def _command(name, alias=None, **kw):
         def deco(fn):
             registered["commands"].append(name)
+            registered["aliases"].extend(alias or [])
             return fn
 
         return deco
@@ -196,7 +197,7 @@ def test_main_imports():
     _mod(
         "astrbot.api.star",
         Context=_Dummy,
-        Star=type("Star", (), {}),
+        Star=type("Star", (), {"__init__": lambda self, ctx: None}),
         register=lambda *a, **kw: lambda cls: cls,
     )
     _mod(
@@ -212,25 +213,20 @@ def test_main_imports():
         "特性",
         "招式",
         "道具",
-        "图鉴",
         "相性",
-        "能力值",
         "克制",
-        "对比",
-        "怎么打",
-        "招式表",
         "对战",
         "队伍分析",
         "筛选",
         "许愿星",
-        "搜索",
-        "宝可梦帮助",
+        "冠军",
     }
     check(
         "指令全部注册",
         expected_cmds <= set(registered["commands"]),
         str(expected_cmds - set(registered["commands"])),
     )
+    check("兼容别名全部移除", registered["aliases"] == [], str(registered["aliases"]))
 
     expected_tools = {
         "query_pokemon",
@@ -252,6 +248,12 @@ def test_main_imports():
         "simulate_battle",
         "analyze_team",
         "find_pokemon_by_stats",
+        "query_champions_ranking",
+        "query_pokemon_rank",
+        "query_champions_build",
+        "find_champions_by_item",
+        "query_champions_trend",
+        "champions_data_status",
     }
     check(
         "llm_tool 全部注册",
@@ -269,6 +271,86 @@ def test_main_imports():
             if not re.search(rf"^\s*{re.escape(p)}\([^):]+\):", doc, re.MULTILINE):
                 bad.append(f"{fn.__name__}:{p}")
     check("llm_tool 参数全部有 docstring 类型标注（Args）", not bad, str(bad))
+
+    class _Ev:
+        message_str = ""
+
+        def __init__(self, raw=""):
+            self.message_str = raw
+
+        def plain_result(self, t):
+            return t
+
+    async def _run(coro_gen, ev):
+        return [r async for r in coro_gen]
+
+    async def _directions():
+        plugin = main.PokedexPlugin(context=None, config={})
+        out = await _run(plugin.cmd_matchups(_Ev(), "打", "火"), _Ev("相性 打 火"))
+        check("相性 打 火（进攻）含效果拔群", any("效果拔群" in r for r in out))
+        out = await _run(plugin.cmd_matchups(_Ev(), "火", "飞行"), _Ev("相性 火 飞行"))
+        check(
+            "相性 火 飞行（防守）含弱点/抗性",
+            any("弱点" in r for r in out) and any("抗性" in r for r in out),
+        )
+        hint = plugin._pokemon_related_hint({"name_zh": "烈咬陆鲨", "form_name": ""})
+        check(
+            "图鉴反查提示含冠军赛名次与后续指令",
+            "冠军赛 单#1" in hint
+            and "宝可梦 烈咬陆鲨 招式表" in hint
+            and "克制 烈咬陆鲨" in hint,
+            hint,
+        )
+
+    import asyncio
+
+    asyncio.run(_directions())
+
+    async def _hub():
+        plugin = main.PokedexPlugin(context=None, config={})
+
+        class _Ev2(_Ev):
+            def plain_result(self, t):
+                return t
+
+        out = await _run(plugin.cmd_pokemon(_Ev2(), "皮卡丘 招式表 50"), _Ev2())
+        check(
+            "宝可梦 X 招式表 子视图",
+            any("可学招式" in r or "推荐配招" in r for r in out),
+            str(out)[:120],
+        )
+        out = await _run(plugin.cmd_pokemon(_Ev2(), "皮卡丘 能力值 50 31 固执"), _Ev2())
+        check("宝可梦 X 能力值 子视图", any("总和" in r for r in out))
+        out = await _run(plugin.cmd_pokemon(_Ev2(), ""), _Ev2())
+        check("宝可梦 无参 → 帮助", any("宝可梦图鉴插件" in r for r in out))
+        out = await plugin.tool_search_pokemon(_Ev2(), "丰缘")
+        check("search_pokemon 工具含地区图鉴", "图鉴" in out, out[:120])
+        out = await plugin.tool_query_item(_Ev2(), "讲究围巾")
+        check("query_item 原子工具", "讲究围巾" in out and "类别" in out)
+        out = await plugin.tool_rank_pokemon(_Ev2(), 3, fmt="double")
+        check(
+            "query_rank_pokemon 原子工具",
+            "第 3 名" in out and "大狃拉" in out,
+            out[:120],
+        )
+        out = await plugin.tool_champ_lookup(_Ev2(), "烈咬陆鲨")
+        check(
+            "query_pokemon_rank 只查名称名次", "单打：#1" in out and "双打：#1" in out
+        )
+        out = await _run(plugin.cmd_counter(_Ev2(), "妙蛙花"), _Ev2())
+        check(
+            "克制 X = 克制推荐",
+            any("筛选条件" in r and "克制 妙蛙花" in r for r in out),
+        )
+        out = await _run(plugin.cmd_counter(_Ev2(), "皮卡丘", "喷火龙"), _Ev2())
+        check(
+            "克制 A B = 多维度对比含小结",
+            any("小结：" in r and "面板" in r for r in out),
+        )
+        out = await _run(plugin.cmd_counter(_Ev2(), "不存在兽"), _Ev2())
+        check("克制 查无此人 → 提示用相性", any("相性" in r for r in out))
+
+    asyncio.run(_hub())
 
     conds = main.parse_stat_conditions("速度>100 特攻>=120 总和<=500")
     check(
@@ -648,6 +730,211 @@ def test_ability_corrections():
     check("火属性有引火修正", "火" in corr2)
 
 
+def test_card_champion_section():
+    section("图鉴卡片冠军赛名次条（Pillow 渲染）")
+    import io
+
+    from PIL import Image
+
+    from card_renderer import CardRenderer
+
+    db = PokedexDB()
+    renderer = CardRenderer()
+    row = next(
+        r
+        for r in db.table("pokemon")
+        if r.get("name_zh") == "皮卡丘" and not r.get("form_name")
+    )
+    stats, total = db.first_stats(row)
+    base = renderer.render_pokemon_card(row, stats, total)
+    with_champ = renderer.render_pokemon_card(
+        row,
+        stats,
+        total,
+        champion={"season": "M-7", "single": 7, "double": 5, "total": 262},
+    )
+    h1 = Image.open(io.BytesIO(base)).height
+    h2 = Image.open(io.BytesIO(with_champ)).height
+    check("名次条使卡片增高 ≥40px", h2 - h1 >= 40, f"{h1} -> {h2}")
+    png = Image.open(io.BytesIO(with_champ))
+    check(
+        "卡片尺寸合法（宽 1080，PNG 可解码）", png.width == 1080 and png.mode == "RGB"
+    )
+
+
+def test_champ_arg_parser():
+    section("冠军指令参数分类（单入口 token 消歧）")
+    import main  # 依赖 test_main_imports 已注入的 astrbot stub
+
+    P = main.PokedexPlugin._parse_champ_args
+    a = P("")
+    check(
+        "空参数",
+        a == {"fmt": None, "rank": None, "season": None, "view": None, "names": []},
+        str(a),
+    )
+    a = P("双打")
+    check("格式词", a["fmt"] == "double" and not a["names"])
+    a = P("单打 3")
+    check("格式+名次", a["fmt"] == "single" and a["rank"] == 3)
+    a = P("#3")
+    check("#3 名次", a["rank"] == 3)
+    a = P("烈咬陆鲨")
+    check("宝可梦名", a["names"] == ["烈咬陆鲨"])
+    a = P("烈咬陆鲨 6")
+    check("名+数字 → 赛季", a["names"] == ["烈咬陆鲨"] and a["season"] == "M-6")
+    a = P("烈咬陆鲨 M-6")
+    check("显式赛季", a["season"] == "M-6")
+    a = P("双打 上一轮")
+    check("语义赛季", a["fmt"] == "double" and a["season"] == "prev")
+    a = P("3 6")
+    check("双数字 = 名次+赛季", a["rank"] == 3 and a["season"] == "M-6")
+    a = P("生命宝珠")
+    check("道具名走 names", a["names"] == ["生命宝珠"])
+    a = P("谜拟丘 趋势")
+    check("趋势视图", a["view"] == "trend" and a["names"] == ["谜拟丘"])
+    a = P("7赛季 状态")
+    check("N赛季 + 状态视图", a["season"] == "M-7" and a["view"] == "status")
+
+
+def test_champions_db():
+    """冠军赛查询层：临时库写入 -> 排名/配置/反查/趋势/幂等。"""
+    import sqlite3
+    import tempfile
+
+    from champions_db import SCHEMA, ChampionsDB, resolve_db_path, season_key
+
+    section("冠军赛数据（champions_db）")
+
+    check(
+        "赛季排序键 M-7 > M-6（同源内）",
+        season_key("M-7") > season_key("M-6"),
+    )
+    check(
+        "赛季排序键 月份格式按年月比",
+        season_key("2026-10") > season_key("2026-09"),
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        path = f"{td}/champions.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(SCHEMA)
+
+        # 模拟写入端逻辑（champions_fetch.upsert_* 的 SQL 语义）
+        def upsert(pid, name, fmt, season, rank, usage=None):
+            conn.execute(
+                "INSERT INTO champion_pokemon(pokemon_id, name_zh) VALUES(?,?) "
+                "ON CONFLICT(pokemon_id) DO UPDATE SET name_zh=excluded.name_zh",
+                (pid, name),
+            )
+            conn.execute(
+                """INSERT INTO champion_usage(pokemon_id, format, season, source,
+                       usage_pct, rank, updated_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(pokemon_id, format, season, source) DO UPDATE SET
+                     usage_pct=COALESCE(excluded.usage_pct, champion_usage.usage_pct),
+                     rank=COALESCE(excluded.rank, champion_usage.rank)""",
+                (pid, fmt, season, "pokechamdb", usage, rank, "2026/10/17 17:14"),
+            )
+
+        rows = [
+            ("garchomp", "烈咬陆鲨", 1),
+            ("primarina", "西狮海壬", 2),
+            ("mimikyu", "谜拟Ｑ", 3),
+        ]
+        for pid, name, rank in rows:
+            upsert(pid, name, "single", "M-7", rank)
+        upsert("garchomp", "烈咬陆鲨", "single", "M-6", 4)  # 上一赛季
+        upsert("garchomp", "烈咬陆鲨", "double", "M-7", 5)  # 双打
+        conn.commit()
+
+        db = ChampionsDB(path)
+        top = db.top_usage("single", limit=10)
+        check(
+            "top_usage 按 rank 排序",
+            [r["pokemon_id"] for r in top] == ["garchomp", "primarina", "mimikyu"],
+        )
+        check("latest_season 自动取 M-7", db.latest_season("single") == "M-7")
+        check(
+            "resolve_season 空参数回退最新", db.resolve_season(None, "single") == "M-7"
+        )
+        row = db.resolve_pokemon("烈咬陆鲨", "single")
+        check("resolve_pokemon 中文名命中", row and row["pokemon_id"] == "garchomp")
+        by_rank = db.by_rank(2, "single", "M-7")
+        check(
+            "by_rank 第2名→西狮海壬（含 total）",
+            by_rank and by_rank["name_zh"] == "西狮海壬" and by_rank["total"] == 3,
+            str(by_rank),
+        )
+        check("by_rank 越界名次返回 None", db.by_rank(99, "single", "M-7") is None)
+        check(
+            "pokemon_ranks 双格式各带 total",
+            {r["format"]: r["rank"] for r in db.pokemon_ranks("烈咬陆鲨")}
+            == {"single": 1, "double": 5},
+        )
+        check(
+            "trend 跨赛季两行",
+            [r["season"] for r in db.trend("garchomp", "single")] == ["M-6", "M-7"],
+        )
+        check("格式隔离（双打互不干扰）", db.top_usage("double")[0]["rank"] == 5)
+
+        # 配置项
+        uid = conn.execute(
+            "SELECT usage_id FROM champion_usage WHERE pokemon_id='garchomp' "
+            "AND format='single' AND season='M-7'"
+        ).fetchone()[0]
+        conn.executemany(
+            "INSERT INTO champion_option(usage_id, option_type, option_value, usage_pct, rank)"
+            " VALUES(?,?,?,?,?)",
+            [
+                (uid, "move", "地震", 65.0, None),
+                (uid, "move", "隐形岩", 46.0, None),
+                (uid, "item", "生命宝珠", 1.0, None),
+                (uid, "teammate", "巨牙鲨", None, 1),
+            ],
+        )
+        conn.commit()
+        moves = db.pokemon_options("garchomp", "single", "M-7", "move", top_n=1)
+        check(
+            "pokemon_options 按使用率降序+limit",
+            len(moves) == 1 and moves[0]["option_value"] == "地震",
+        )
+        hits = db.find_pokemon_by_item("生命宝珠", "single", "M-7")
+        check(
+            "find_pokemon_by_item 反查",
+            len(hits) == 1
+            and hits[0]["name_zh"] == "烈咬陆鲨"
+            and hits[0]["item_usage_pct"] == 1.0,
+        )
+        check(
+            "未写入 option 的类型返回空",
+            db.pokemon_options("garchomp", "single", "M-7", "nature") == [],
+        )
+
+        # 幂等：同 (pokemon,fmt,season,source) 再写不产生新行
+        def garchomp_rank():
+            return db.resolve_pokemon("烈咬陆鲨", "single", "M-7")["rank"]
+
+        upsert("garchomp", "烈咬陆鲨", "single", "M-7", 9)
+        conn.commit()
+        n = conn.execute(
+            "SELECT COUNT(*) FROM champion_usage WHERE pokemon_id='garchomp' "
+            "AND format='single' AND season='M-7'"
+        ).fetchone()[0]
+        check("幂等 upsert 不新增行", n == 1)
+        check("新排名覆盖旧排名", garchomp_rank() == 9)
+        upsert("garchomp", "烈咬陆鲨", "single", "M-7", None)  # 抓取侧 rank 缺失
+        conn.commit()
+        check("rank 缺失时 COALESCE 保留旧值", garchomp_rank() == 9)
+
+        conn.close()
+
+    check(
+        "resolve_db_path 返回 Path",
+        isinstance(resolve_db_path(None), Path),
+    )
+
+
 from pokedex_db import PokedexDB
 
 if __name__ == "__main__":
@@ -660,6 +947,9 @@ if __name__ == "__main__":
     test_phase3_battle()
     test_phase4_team_and_stats()
     test_ability_corrections()
+    test_champions_db()
     test_main_imports()
+    test_champ_arg_parser()
+    test_card_champion_section()
     print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
     sys.exit(1 if FAIL else 0)
