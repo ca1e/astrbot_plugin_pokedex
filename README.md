@@ -99,7 +99,7 @@ uv run python champions_fetch.py --headed         # 显示浏览器窗口（调�
 行为说明：
 
 - **存储位置**：默认 `AstrBot数据目录/data/plugin_data/astrbot_plugin_pokedex/champions.db`（自动识别，与插件读取路径一致）；可用 `--db` 或环境变量 `POKEDEX_CHAMPIONS_DB` 覆盖。
-- **幂等**：所有写入走 `INSERT ... ON CONFLICT`，重复执行安全。抓取前比对页面「最后更新」时间戳，未变化自动跳过（`--force` 强制重抓）。
+- **幂等**：所有写入走 `INSERT ... ON CONFLICT`，重复执行安全。抓取前比对页面「最后更新」时间戳，未变化自动跳过（`--force` 排名+详情都强制重抓；`--force-detail` 仅强制重抓配置明细，用于排名不变但想刷新明细时）。
 - **频率**：脚本自身不做定时，请用系统 cron 每日跑一次，例如 `0 4 * * * cd /path/to/astrbot_plugin_pokedex && uv run python champions_fetch.py >> data/fetch.log 2>&1`。
 - **代理**：默认依次尝试环境变量（`POKEMON_TRACKER_PROXY`/`HTTPS_PROXY`）与本机常见代理端口（7890/7897/34523 等），都不通则直连；`--proxy http://127.0.0.1:xxxx` 或 `--proxy none` 可显式指定。
 - **单双打详情都要等水合**：详情页 SSR 固定输出**单打**数据，客户端水合后才按 URL 的 `format` 参数重渲染为双打（例如烈咬陆鲨单打招式第一是地震 65%，双打是守住 59%）。脚本对双打额外等待页面出现「双打」字样再解析；meta description 始终是单打的（含单打名次），双打详情不使用它，避免污染双打排名。排名页不提供使用率百分比，只知名次。

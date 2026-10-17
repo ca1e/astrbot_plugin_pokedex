@@ -240,9 +240,19 @@ class Browser:
         log(f"浏览器就绪（proxy={proxy or '直连'}）")
 
     def goto(self, url: str, wait_sel: str):
+        """导航并等待关键区块；超时/网络错误统一转为 FetchError（可重试）。"""
         page = self._ctx.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT * 1000)
-        page.locator(wait_sel).first.wait_for(state="visible", timeout=15000)
+        try:
+            page.goto(
+                url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT * 1000
+            )
+            page.locator(wait_sel).first.wait_for(state="visible", timeout=15000)
+        except Exception as e:  # Playwright TimeoutError 等一并转为 FetchError
+            try:
+                page.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise FetchError(f"打开页面失败：{e}") from e
         return page
 
     def __enter__(self):
@@ -769,7 +779,7 @@ def run(args) -> int:
                             items_written=len(data["items"]),
                         )
                     summary.append(f"{fmt} 排名 {len(data['items'])} 只")
-            except FetchError as e:
+            except Exception as e:  # FetchError 已含重试；其余异常兜底继续
                 log(f"[{fmt}/{season}] 排名抓取失败：{e}")
                 with conn:
                     log_sync(
@@ -779,7 +789,7 @@ def run(args) -> int:
                         season=season,
                         scope=scope,
                         status="failed",
-                        message=str(e),
+                        message=str(e)[:500],
                     )
                 continue  # 排名失败则详情也没法按名次截取
 
@@ -797,9 +807,10 @@ def run(args) -> int:
                     if (
                         prev
                         and not args.force
+                        and not args.force_detail
                         and prev["source_updated_at"] == detail.get("updated_at")
                     ):
-                        continue  # 未变化
+                        continue  # 未变化（--force-detail 时强制重抓）
                     with conn:
                         n = write_detail(
                             conn, detail, pokemon_id=pid, season=season, fmt=fmt
@@ -830,6 +841,16 @@ def run(args) -> int:
                     fail += 1
                 except Exception as e:  # noqa: BLE001
                     log(f"详情 {pid} 异常：{e}")
+                    with conn:
+                        log_sync(
+                            conn,
+                            source="pokechamdb",
+                            fmt=fmt,
+                            season=season,
+                            scope=scope,
+                            status="failed",
+                            message=str(e)[:500],
+                        )
                     fail += 1
                 time.sleep(random.uniform(*DETAIL_DELAY))
             log(f"[{fmt}/{season}] 详情完成：成功 {ok}，失败 {fail}")
@@ -874,7 +895,12 @@ def main() -> int:
     )
     ap.add_argument("--db", help="champions.db 路径（默认 AstrBot plugin_data 目录）")
     ap.add_argument("--proxy", help="代理地址；none=直连；默认自动探测本机代理")
-    ap.add_argument("--force", action="store_true", help="忽略未更新跳过")
+    ap.add_argument("--force", action="store_true", help="忽略未更新跳过（排名+详情）")
+    ap.add_argument(
+        "--force-detail",
+        action="store_true",
+        help="排名未更新时依然强制重抓全部配置明细",
+    )
     ap.add_argument("--headed", action="store_true", help="显示浏览器窗口（调试）")
     args = ap.parse_args()
 
