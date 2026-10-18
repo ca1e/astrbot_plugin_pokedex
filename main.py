@@ -14,7 +14,7 @@
   相性 <属性1> [属性2]  属性相性（相性 打 <属性> = 进攻方向）
   克制 <宝可梦> [B]     克制推荐 / 多维度对比
   对战/队伍分析/筛选    组合分析
-  冠军 <关键词>         冠军赛一站式查询
+  宝冠军 <关键词>        冠军赛一站式查询
   许愿星 <…>            许愿星基拉祈 RNG 筛选
 """
 
@@ -201,7 +201,7 @@ class PokedexPlugin(Star):
         parts = []
         champ = self._champ_rank_short(name)
         if champ:
-            parts.append(f"冠军赛 {champ}（冠军 {name} 看配置）")
+            parts.append(f"冠军赛 {champ}（宝冠军 {name} 看配置）")
         if not row.get("form_name"):
             parts.append(f"宝可梦 {name} 招式表")
             parts.append(f"宝可梦 {name} 能力值 50")
@@ -810,14 +810,14 @@ class PokedexPlugin(Star):
 
     # ---------- 冠军赛季数据（champions.db，只读查询） ----------
     # 一个入口搞定全部查询，参数按 token 自动分类：
-    #   冠军                          → 数据状态 + 用法
-    #   冠军 单打 / 冠军 双打          → Top10（可再加赛季：M-6 / 6 / 上一轮）
-    #   冠军 3 / 冠军 双打 3           → 第3名是谁（附配置摘要）
-    #   冠军 烈咬陆鲨                  → 名次（单+双）+ 配置使用率
-    #   冠军 烈咬陆鲨 趋势             → 跨赛季名次变化
-    #   冠军 烈咬陆鲨 M-6             → 指定赛季（数字与名称同现时视为赛季）
-    #   冠军 生命宝珠                  → 道具反查（谁在带它）
-    #   冠军 数据                      → 本地库状态
+    #   宝冠军                         → 数据状态 + 用法
+    #   宝冠军 单打 / 宝冠军 双打       → Top10（可再加赛季：M-6 / 6 / 上一轮）
+    #   宝冠军 3 / 宝冠军 双打 3        → 第3名是谁（附配置摘要）
+    #   宝冠军 烈咬陆鲨                 → 名次（单+双）+ 配置使用率
+    #   宝冠军 烈咬陆鲨 趋势            → 跨赛季名次变化
+    #   宝冠军 烈咬陆鲨 M-6            → 指定赛季（数字与名称同现时视为赛季）
+    #   宝冠军 生命宝珠                 → 道具反查（谁在带它）
+    #   宝冠军 数据                     → 本地库状态
     CHAMP_FORMATS: ClassVar[dict[str, str]] = {
         "单打": "single",
         "双打": "double",
@@ -848,8 +848,8 @@ class PokedexPlugin(Star):
     def _parse_champ_args(cls, text: str) -> dict:
         """把指令参数按 token 分类。
 
-        数字语义消歧：与名称词同现时视为赛季编号（冠军 烈咬陆鲨 6 → M-6），
-        否则首个数字是名次（冠军 3 → 第3名）、第二个数字是赛季。
+        数字语义消歧：与名称词同现时视为赛季编号（宝冠军 烈咬陆鲨 6 → M-6），
+        否则首个数字是名次（宝冠军 3 → 第3名）、第二个数字是赛季。
         返回 {fmt, rank, season, view, names}；season 取值 None(最新)/"prev"/"M-N"。
         """
         fmt = rank = view = None
@@ -1002,7 +1002,7 @@ class PokedexPlugin(Star):
             )
         if rows[0].get("usage_pct") is None:
             lines.append("（该来源仅提供名次，无使用率百分比）")
-        lines.append("提示：冠军 3 = 第3名是谁｜冠军 <宝可梦> = 名次+配置")
+        lines.append("提示：宝冠军 3 = 第3名是谁｜宝冠军 <宝可梦> = 名次+配置")
         return "\n".join(lines)
 
     def _champ_rank_row_text(self, fmt: str, row: dict) -> str:
@@ -1024,7 +1024,7 @@ class PokedexPlugin(Star):
             if line:
                 lines.append(line)
         lines.append(
-            f"提示：冠军 {row['name_zh'] or row['pokemon_id']} = 完整配置与单双打名次"
+            f"提示：宝冠军 {row['name_zh'] or row['pokemon_id']} = 完整配置与单双打名次"
         )
         return "\n".join(line for line in lines if line)
 
@@ -1077,7 +1077,7 @@ class PokedexPlugin(Star):
                     lines.append(("　" if len(fmts) > 1 else "") + line)
         other = next(f for f in ("single", "double") if f != fmt_show)
         lines.append(
-            f"提示：冠军 {name} 趋势 = 跨赛季｜冠军 {name} "
+            f"提示：宝冠军 {name} 趋势 = 跨赛季｜宝冠军 {name} "
             f"{fmt_label(other)} = 另一格式"
         )
         return "\n".join(line for line in lines if line)
@@ -1099,7 +1099,7 @@ class PokedexPlugin(Star):
         if not any_row:
             lines.append("本地只有一个赛季的数据，暂无趋势（多抓几个赛季后再试）")
         else:
-            lines.append("提示：冠军 <宝可梦> = 当前赛季完整配置")
+            lines.append("提示：宝冠军 <宝可梦> = 当前赛季完整配置")
         return "\n".join(lines)
 
     def _champ_item_text(
@@ -1120,7 +1120,7 @@ class PokedexPlugin(Star):
                 else ""
             )
             lines.append(f"#{r['rank']} {r['name_zh'] or r['pokemon_id']}{pct}")
-        lines.append("提示：冠军 <宝可梦名> = 它的完整配置")
+        lines.append("提示：宝冠军 <宝可梦名> = 它的完整配置")
         return "\n".join(line for line in lines if line)
 
     def _champ_status_text(self) -> str:
@@ -1162,20 +1162,20 @@ class PokedexPlugin(Star):
         st_line = ""
         latest = self.champions.latest_season("single")
         if latest:
-            st_line = f"当前本地赛季：{latest}（冠军 数据 看详情）\n"
+            st_line = f"当前本地赛季：{latest}（宝冠军 数据 看详情）\n"
         return (
-            "【冠军赛查询】\n" + st_line + "冠军 单打 / 冠军 双打 — Top10\n"
-            "冠军 3 / 冠军 双打 3 — 第3名是谁\n"
-            "冠军 <宝可梦> — 名次(单双) + 配置使用率\n"
-            "冠军 <宝可梦> 趋势 — 跨赛季名次\n"
-            "冠军 <道具名> — 谁在带这个道具\n"
+            "【冠军赛查询】\n" + st_line + "宝冠军 单打 / 宝冠军 双打 — Top10\n"
+            "宝冠军 3 / 宝冠军 双打 3 — 第3名是谁\n"
+            "宝冠军 <宝可梦> — 名次(单双) + 配置使用率\n"
+            "宝冠军 <宝可梦> 趋势 — 跨赛季名次\n"
+            "宝冠军 <道具名> — 谁在带这个道具\n"
             "赛季：默认最新，可加 M-6 / 6 / 上一轮\n"
             "对战 <A> <B> 结果里也会带双方名次"
         )
 
-    @filter.command("冠军")
+    @filter.command("宝冠军")
     async def cmd_champion(self, event: AstrMessageEvent, keyword: str = ""):
-        """冠军赛一站式查询：冠军 帮助 看用法"""
+        """冠军赛一站式查询：宝冠军 帮助 看用法"""
         if not self.champions.exists:
             yield event.plain_result(self._champ_no_data())
             return
@@ -1245,7 +1245,7 @@ class PokedexPlugin(Star):
             return
         yield event.plain_result(
             f"「{name}」既不在 {fmt_label(fmt_eff)} 榜单也没有道具匹配；"
-            f"发「冠军 帮助」看用法"
+            f"发「宝冠军 帮助」看用法"
         )
 
     def _help_text(self) -> str:
@@ -1261,7 +1261,7 @@ class PokedexPlugin(Star):
             "队伍分析 <名称...> — 队伍弱点配置分析\n"
             "筛选 <条件> — 按种族值筛选，如 速度>100 特攻>=120\n"
             "许愿星 <性格> [个体下限] [TID SID] — 许愿星基拉祈目标筛选\n"
-            "冠军 <关键词> — 冠军赛一站式查询，冠军 帮助 看用法\n"
+            "宝冠军 <关键词> — 冠军赛一站式查询，宝冠军 帮助 看用法\n"
             "群聊 @我 直接提问时也会自动调用图鉴工具（需模型支持函数调用）"
         )
 

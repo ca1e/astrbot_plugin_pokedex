@@ -18,6 +18,12 @@
     uv run python champions_fetch.py --force             # 忽略"未更新则跳过"
     uv run python champions_fetch.py --pokemon garchomp  # 只补一只详情（调试）
 
+    # 单独拉取：--format 与 --ranking-only / --details-only 组合使用
+    uv run python champions_fetch.py --format double --ranking-only
+    #   ↑ 只刷新双打排名榜单（不抓详情），也是修复库内双打排名脏数据的方式
+    uv run python champions_fetch.py --format single --details-only
+    #   ↑ 只抓单打详情配置，目标名次列表复用库中已有排名（需先抓过排名）
+
 数据源：
   * PokéChamp DB https://pokechamdb.com （必抓：排名 + 招式/道具/特性/性格/EV/队友）
   * poke.itlibra.com 开放数据（可选：月度使用率百分比，PokéChamp 不提供 %）
@@ -89,6 +95,27 @@ JS_RANKING = r"""
     rows.push({ slug: m[1], rank, name: name || alt });
   });
   return rows;
+}
+"""
+
+# 排名页与详情页同样存在「SSR 固定单打、水合后重渲染为双打」的行为，但排名页
+# SSR 里本来就有「双打」字样（格式切换按钮），详情页的文字标记等待在此不可用。
+# 改为记录初始 slug 序列快照，等待重渲染使序列变化（双打榜序与单打不同）。
+JS_RANK_SLUGS = r"""
+() => Array.from(document.querySelectorAll('a[href*="/pokemon/"]'))
+  .map(a => ((a.getAttribute('href') || '').match(/\/pokemon\/([^?\/]+)/) || [])[1])
+  .filter(Boolean)
+  .join(',')
+"""
+
+JS_RANK_CHANGED = r"""
+(init) => {
+  const cur = Array.from(document.querySelectorAll('a[href*="/pokemon/"]'))
+    .map(a => ((a.getAttribute('href') || '').match(/\/pokemon\/([^?\/]+)/) || [])[1])
+    .filter(Boolean)
+    .join(',');
+  // 水合重渲染过程中列表会短暂清空，空序列不算完成
+  return cur !== init && cur.length > 0;
 }
 """
 
@@ -433,11 +460,23 @@ def _with_retries(fn, label: str, attempts: int = RETRIES + 1):
     raise FetchError(f"{label} 重试 {attempts} 次后仍失败：{last}")
 
 
-def scrape_ranking(br: Browser, season: str, fmt: str) -> dict:
+def scrape_ranking(
+    br: Browser, season: str, fmt: str, stale_seq: str | None = None
+) -> dict:
     def once() -> dict:
         url = f"{BASE}/{LANG}?format={fmt}&season={season}&view=pokemon"
         page = br.goto(url, 'a[href*="/pokemon/"]')
         try:
+            if fmt == "double":
+                # 排名页 SSR 固定输出单打榜单，水合后才按 format 参数重渲染为
+                # 双打；记录初始 slug 序列，等待重渲染使序列变化。超时通常是
+                # 水合先于快照完成（数据已是双打），警告后按当前 DOM 继续。
+                init = page.evaluate(JS_RANK_SLUGS) or ""
+                try:
+                    page.wait_for_function(JS_RANK_CHANGED, arg=init, timeout=15000)
+                    log("双打排名页水合完成（榜单已重渲染）")
+                except Exception as e:  # noqa: BLE001
+                    log(f"双打排名水合等待超时（{e.__class__.__name__}），按当前 DOM 继续")
             rows = page.evaluate(JS_RANKING) or []
             updated = page.evaluate(JS_UPDATED) or None
             if not updated:
@@ -462,10 +501,49 @@ def scrape_ranking(br: Browser, season: str, fmt: str) -> dict:
         items.sort(key=lambda r: (r["rank"] is None, r["rank"] or 0))
         if not items:
             raise FetchError(f"排名页解析为空：{url}（可能限流或页面改版）")
+        seq = ",".join(it["pokemon_id"] for it in items)
+        if stale_seq and seq == stale_seq:
+            # 双打最终序列与库中单打序列完全一致 => 拿到的仍是 SSR 单打数据
+            raise FetchError("双打排名与单打完全一致，疑似水合未完成")
         log(f"排名 [{fmt}/{season}] {len(items)} 只，站点更新 {updated or '未知'}")
         return {"items": items, "updated_at": updated}
 
     return _with_retries(once, f"排名 [{fmt}/{season}]")
+
+
+def _single_rank_seq(conn) -> str | None:
+    """库中最新单打赛季的排名 slug 序列，用作双打抓取的"错值"参照。"""
+    rows = conn.execute(
+        "SELECT DISTINCT season FROM champion_usage"
+        " WHERE format='single' AND source='pokechamdb'"
+    ).fetchall()
+    if not rows:
+        return None
+    from champions_db import season_key
+
+    season = sorted((r["season"] for r in rows), key=season_key, reverse=True)[0]
+    rows = conn.execute(
+        "SELECT pokemon_id FROM champion_usage"
+        " WHERE format='single' AND source='pokechamdb' AND season=?"
+        " ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank",
+        (season,),
+    ).fetchall()
+    return ",".join(r["pokemon_id"] for r in rows) or None
+
+
+def _targets_from_db(conn, fmt: str, season: str, top: int, fetch_all: bool):
+    """--details-only 时从库中读取排名列表作为详情抓取目标。"""
+    rows = conn.execute(
+        "SELECT pokemon_id, name_zh, rank FROM champion_usage"
+        " WHERE format=? AND season=? AND source='pokechamdb'"
+        " ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank",
+        (fmt, season),
+    ).fetchall()
+    items = [
+        {"pokemon_id": r["pokemon_id"], "name_zh": r["name_zh"], "rank": r["rank"]}
+        for r in rows
+    ]
+    return items if fetch_all else items[:top]
 
 
 def scrape_detail(br: Browser, pokemon_id: str, season: str, fmt: str) -> dict:
@@ -734,70 +812,82 @@ def run(args) -> int:
             season = latest_season_id(br, "M-7")
 
         for fmt in formats:
-            # ---- 排名 ----
-            scope = "ranking"
-            prev = last_sync(conn, "pokechamdb", fmt, season, scope)
-            try:
-                data = scrape_ranking(br, season, fmt)
-                if (
-                    prev
-                    and not args.force
-                    and prev["source_updated_at"]
-                    and prev["source_updated_at"] == data["updated_at"]
-                ):
-                    log_sync(
-                        conn,
-                        source="pokechamdb",
-                        fmt=fmt,
-                        season=season,
-                        scope=scope,
-                        status="skipped",
-                        source_updated_at=data["updated_at"],
-                        message="页面时间戳未变化，跳过",
-                    )
-                    log(f"[{fmt}/{season}] 排名未更新，跳过写入")
-                else:
-                    with conn:
-                        for it in data["items"]:
-                            upsert_pokemon(conn, it["pokemon_id"], it["name_zh"])
-                            upsert_usage(
-                                conn,
-                                pokemon_id=it["pokemon_id"],
-                                fmt=fmt,
-                                season=season,
-                                source="pokechamdb",
-                                rank=it["rank"],
-                                updated_at=data["updated_at"],
-                            )
+            items: list[dict] | None = None
+            # ---- 排名 ----（--details-only 时跳过抓取，详情目标改从库中读取）
+            if not args.details_only:
+                scope = "ranking"
+                prev = last_sync(conn, "pokechamdb", fmt, season, scope)
+                try:
+                    # 双打传入库中单打排名序列作"错值"参照，防 SSR 单打误写
+                    stale_seq = _single_rank_seq(conn) if fmt == "double" else None
+                    data = scrape_ranking(br, season, fmt, stale_seq=stale_seq)
+                    items = data["items"]
+                    if (
+                        prev
+                        and not args.force
+                        and prev["source_updated_at"]
+                        and prev["source_updated_at"] == data["updated_at"]
+                    ):
                         log_sync(
                             conn,
                             source="pokechamdb",
                             fmt=fmt,
                             season=season,
                             scope=scope,
-                            status="ok",
+                            status="skipped",
                             source_updated_at=data["updated_at"],
-                            items_written=len(data["items"]),
+                            message="页面时间戳未变化，跳过",
                         )
-                    summary.append(f"{fmt} 排名 {len(data['items'])} 只")
-            except Exception as e:  # FetchError 已含重试；其余异常兜底继续
-                log(f"[{fmt}/{season}] 排名抓取失败：{e}")
-                with conn:
-                    log_sync(
-                        conn,
-                        source="pokechamdb",
-                        fmt=fmt,
-                        season=season,
-                        scope=scope,
-                        status="failed",
-                        message=str(e)[:500],
-                    )
-                continue  # 排名失败则详情也没法按名次截取
+                        log(f"[{fmt}/{season}] 排名未更新，跳过写入")
+                    else:
+                        with conn:
+                            for it in data["items"]:
+                                upsert_pokemon(conn, it["pokemon_id"], it["name_zh"])
+                                upsert_usage(
+                                    conn,
+                                    pokemon_id=it["pokemon_id"],
+                                    fmt=fmt,
+                                    season=season,
+                                    source="pokechamdb",
+                                    rank=it["rank"],
+                                    updated_at=data["updated_at"],
+                                )
+                            log_sync(
+                                conn,
+                                source="pokechamdb",
+                                fmt=fmt,
+                                season=season,
+                                scope=scope,
+                                status="ok",
+                                source_updated_at=data["updated_at"],
+                                items_written=len(data["items"]),
+                            )
+                        summary.append(f"{fmt} 排名 {len(data['items'])} 只")
+                except Exception as e:  # FetchError 已含重试；其余异常兜底继续
+                    log(f"[{fmt}/{season}] 排名抓取失败：{e}")
+                    with conn:
+                        log_sync(
+                            conn,
+                            source="pokechamdb",
+                            fmt=fmt,
+                            season=season,
+                            scope=scope,
+                            status="failed",
+                            message=str(e)[:500],
+                        )
+                    continue  # 排名失败则详情也没法按名次截取
 
             # ---- 详情 ----
             # 单双打详情都抓：详情页 SSR 固定单打，双打数据在水合后渲染，
             # scrape_detail 内部对 double 额外等待「双打」标记出现。
-            targets = data["items"] if args.all else data["items"][: args.top]
+            if args.ranking_only:
+                continue
+            if items is None:  # --details-only：从库中排名列表定位目标
+                items = _targets_from_db(conn, fmt, season, args.top, args.all)
+                if not items:
+                    log(f"[{fmt}/{season}] 库中没有排名数据，--details-only 需先抓排名")
+                    continue
+            targets = items if args.all else items[: args.top]
             ok = fail = 0
             for it in targets:
                 pid = it["pokemon_id"]
@@ -903,7 +993,20 @@ def main() -> int:
         help="排名未更新时依然强制重抓全部配置明细",
     )
     ap.add_argument("--headed", action="store_true", help="显示浏览器窗口（调试）")
+    ap.add_argument(
+        "--ranking-only",
+        action="store_true",
+        help="只抓排名榜单，跳过详情（与 --format 组合可单独拉单/双打）",
+    )
+    ap.add_argument(
+        "--details-only",
+        action="store_true",
+        help="只抓详情配置，目标名次复用库中已有排名（与 --format 组合）",
+    )
     args = ap.parse_args()
+
+    if args.ranking_only and args.details_only:
+        ap.error("--ranking-only 与 --details-only 不能同时使用")
 
     if args.pokemon:
         db_path = resolve_db_path(args.db)
