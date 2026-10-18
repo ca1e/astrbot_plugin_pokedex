@@ -231,7 +231,8 @@ class Browser:
         from playwright.sync_api import sync_playwright
 
         self._pw = sync_playwright().start()
-        kwargs = {"headless": headless}
+        # 经代理时 HTTP/2 易被中间层掐断（ERR_HTTP2_PROTOCOL_ERROR），强制 HTTP/1.1
+        kwargs = {"headless": headless, "args": ["--disable-http2"]}
         if proxy:
             kwargs["proxy"] = {"server": proxy}
         self._browser = self._pw.chromium.launch(**kwargs)
