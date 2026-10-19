@@ -213,6 +213,7 @@ def test_main_imports():
         "特性",
         "招式",
         "道具",
+        "性格",
         "相性",
         "克制",
         "对战",
@@ -233,6 +234,7 @@ def test_main_imports():
         "search_pokemon",
         "query_ability",
         "query_move",
+        "query_nature",
         "query_dex_region",
         "query_type_matchups",
         "query_wishmaker_jirachi",
@@ -321,12 +323,37 @@ def test_main_imports():
         )
         out = await _run(plugin.cmd_pokemon(_Ev2(), "皮卡丘 能力值 50 31 固执"), _Ev2())
         check("宝可梦 X 能力值 子视图", any("总和" in r for r in out))
+        check(
+            "能力值输出附性格修正说明",
+            any("攻击+10%" in r and "特攻-10%" in r for r in out),
+            str(out)[:120],
+        )
         out = await _run(plugin.cmd_pokemon(_Ev2(), ""), _Ev2())
         check("宝可梦 无参 → 帮助", any("宝可梦图鉴插件" in r for r in out))
         out = await plugin.tool_search_pokemon(_Ev2(), "丰缘")
         check("search_pokemon 工具含地区图鉴", "图鉴" in out, out[:120])
         out = await plugin.tool_query_item(_Ev2(), "讲究围巾")
         check("query_item 原子工具", "讲究围巾" in out and "类别" in out)
+        out = await _run(plugin.cmd_nature(_Ev2(), ""), _Ev2())
+        check("性格 无参 → 全表速查", any("性格速查" in r and "中性" in r for r in out))
+        out = await _run(plugin.cmd_nature(_Ev2(), "固执"), _Ev2())
+        check(
+            "性格 固执 → 增减与口味",
+            any("adamant" in r and "攻击+10%" in r and "涩味" in r for r in out),
+            str(out)[:120],
+        )
+        out = await _run(plugin.cmd_nature(_Ev2(), "勤奋"), _Ev2())
+        check("性格 勤奋 → 中性无修正", any("无能力修正" in r for r in out))
+        out = await _run(plugin.cmd_nature(_Ev2(), "胆"), _Ev2())
+        check("性格 片段匹配 → 胆小/胆量候选", any("胆小" in r for r in out))
+        out = await plugin.tool_query_nature(_Ev2(), "胆小")
+        check(
+            "query_nature 原子工具",
+            "timid" in out and "速度+10%" in out and "辣味" in out,
+            out[:120],
+        )
+        out = await _run(plugin.cmd_nature(_Ev2(), "不存在的"), _Ev2())
+        check("性格 未识别 → 引导全表", any("没有性格" in r for r in out))
         out = await plugin.tool_rank_pokemon(_Ev2(), 3, fmt="double")
         check(
             "query_rank_pokemon 原子工具",

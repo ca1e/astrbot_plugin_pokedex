@@ -28,6 +28,7 @@ v0.3.0 起新增**宝可梦 Champions 冠军赛数据**查询：使用率排名�
   | `宝可梦 <名称> 招式表 [等级]` | 可学招式（升级/学习器/遗传）+ 推荐配招 |
   | `宝可梦 <名称> 能力值 [等级 个体 性格]` | 官方公式计算等级能力值（等级默认 50，个体默认 31） |
   | `特性 <名称>` / `招式 <名称>` / `道具 <名称>` | 对应数据查询 |
+  | `性格 [名称]` | 25 种性格能力修正速查（性格 固执 看单项 + 口味偏好） |
   | `相性 <属性1> [属性2]` / `相性 打 <属性>` | 属性相性防守/进攻双向（含受击类特性修正提示） |
   | `克制 <宝可梦>` | 推荐克制它的候选（双向验证 + 种族值排序） |
   | `克制 <A> <B>` | 多维度对比：逐项种族值 + 属性互克 + 特性 + 小结 |
@@ -44,7 +45,7 @@ v0.3.0 起新增**宝可梦 Champions 冠军赛数据**查询：使用率排名�
   | `宝冠军 数据` | 本地库状态、来源与更新时间 |
 
 - **LLM 函数调用工具**（需模型供应商支持 function calling；群聊 @机器人 自然语言提问时自动调用）：
-  - 查询：`query_pokemon` / `search_pokemon`（跨表，含地区图鉴） / `query_ability` / `query_move` / `query_item` / `query_dex_region` / `query_type_matchups` / `find_pokemon_by_type`
+  - 查询：`query_pokemon` / `search_pokemon`（跨表，含地区图鉴） / `query_ability` / `query_move` / `query_item` / `query_nature`（性格修正） / `query_dex_region` / `query_type_matchups` / `find_pokemon_by_type`
   - 计算/分析：`calc_pokemon_stats`（等级能力值）/ `query_type_offense`（进攻相性）/ `compare_pokemon`（对比）/ `find_pokemon_counters`（克制推荐）/ `query_learnset`（招式表）/ `validate_pokemon_moveset`（配招校验）/ `simulate_battle`（对战模拟）/ `analyze_team`（队伍分析）/ `find_pokemon_by_stats`（按种族值筛选）
   - PokéAPI 补充：`pokeapi_pokemon_detail`（官方译名/图鉴说明/英文特性效果）、`pokeapi_type_matchups`（官方倍率表）
   - 冠军赛：`query_champions_ranking`（排名）/ `query_pokemon_rank`（某宝可梦名次）/ `query_rank_pokemon`（名次反查宝可梦）/ `query_champions_build`（配置）/ `find_champions_by_item`（道具反查）/ `query_champions_trend`（趋势）/ `champions_data_status`（数据状态）

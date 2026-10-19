@@ -2,7 +2,7 @@ name: "astrbot_plugin_pokedex"
 display_name: "宝可梦图鉴"
 short_desc: "本地中文宝可梦图鉴 + 能力值计算 + 对战模拟 + 队伍分析 + 冠军赛数据"
 desc: "宝可梦图鉴插件：内置 pokemon-dataset-zh 中文图鉴库（1025 只宝可梦 + 295 个形态、特性、招式、道具、24 个地区图鉴、基准属性表），支持指令与 LLM 函数调用查询，图鉴结果以图片卡片展示。查询优先使用本地中文数据，PokéAPI 官方数据作为补充（可配置关闭，纯离线运行）。v0.2.0 新增能力值计算、双向属性相性、宝可梦对比、克制推荐、招式表/配招校验、回合制对战模拟、队伍分析与种族值筛选，全部本地数据离线可用。v0.3.0 新增宝可梦 Champions 冠军赛数据查询（使用率排名 Top10、招式/道具/特性/性格/能力点/队友配置、道具反查、跨赛季趋势），数据由独立脚本 champions_fetch.py 从 PokéChamp DB 抓取写入本地 SQLite，插件运行时只读、零网络请求。"
-version: "v0.3.1"
+version: "v0.3.2"
 author: "ca1e"
 repo: "https://github.com/ca1e/astrbot_plugin_pokedex"
 homepage: ""
@@ -25,6 +25,7 @@ features:
   - "队伍分析（共同弱点/全队抗性）与按种族值筛选"
   - "PokéAPI 官方数据补充（详情/相性，可配置关闭）"
   - "冠军赛数据查询（排名/配置/道具反查/趋势，本地 SQLite 只读，独立脚本抓取）"
+  - "性格查询（25 种性格能力修正 + 口味偏好速查，能力值/许愿星输出附性格说明）"
 keywords:
   - pokemon
   - 宝可梦

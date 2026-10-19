@@ -10,7 +10,7 @@
 指令：
   宝可梦                帮助（宝可梦 <名> 招式表/能力值 … 为其子视图）
   宝可梦 <编号或名称>   图鉴详情（图片卡片，含冠军赛名次）
-  特性/招式/道具 <名称> 数据查询
+  特性/招式/道具/性格 <名称> 数据查询
   相性 <属性1> [属性2]  属性相性（相性 打 <属性> = 进攻方向）
   克制 <宝可梦> [B]     克制推荐 / 多维度对比
   对战/队伍分析/筛选    组合分析
@@ -111,6 +111,51 @@ WISHMAKER_NATURES = (
     "胆小 急躁 认真 爽朗 天真 内敛 慢吞吞 温和 害羞 马虎 "
     "沉着 温柔 自大 慎重 浮躁"
 )
+
+# 性格英文名（与 battle_engine.NATURES 的中文名一一对应，官方译名）
+NATURE_EN = {
+    "勤奋": "hardy", "怕寂寞": "lonely", "勇敢": "brave", "固执": "adamant",
+    "顽皮": "naughty", "大胆": "bold", "坦率": "docile", "悠闲": "relaxed",
+    "淘气": "impish", "乐天": "lax", "胆小": "timid", "急躁": "hasty",
+    "认真": "serious", "爽朗": "jolly", "天真": "naive", "内敛": "modest",
+    "慢吞吞": "mild", "温和": "quiet", "害羞": "bashful", "马虎": "rash",
+    "沉着": "calm", "温柔": "gentle", "自大": "sassy", "慎重": "careful",
+    "浮躁": "quirky",
+}
+# 树果口味对应的能力项：性格提升项=喜欢的口味，降低项=讨厌的口味
+NATURE_FLAVOR = {"攻击": "辣", "防御": "酸", "速度": "甜", "特攻": "涩", "特防": "苦"}
+
+
+def nature_effect_text(nature: str) -> str:
+    """一行性格说明：能力修正 + 口味偏好，如"固执：攻击+10%、特攻-10%（喜欢辣味、讨厌涩味）"。"""
+    pair = NATURES[nature]
+    en = NATURE_EN.get(nature, nature)
+    if pair is None:
+        return f"{nature}（{en}）：无能力修正（中性性格）"
+    boost, lower = pair
+    like, hate = NATURE_FLAVOR[boost], NATURE_FLAVOR[lower]
+    return (
+        f"{nature}（{en}）：{boost}+10%、{lower}-10%"
+        f"（喜欢{like}味、讨厌{hate}味）"
+    )
+
+
+def nature_table_text() -> str:
+    """全部 25 种性格按提升项分组的速查表（保持官方表顺序）。"""
+    groups: dict[str, list[str]] = {
+        "攻击": [], "防御": [], "速度": [], "特攻": [], "特防": [], "中性": []
+    }
+    for name, pair in NATURES.items():
+        if pair is None:
+            groups["中性"].append(name)
+        else:
+            boost, lower = pair
+            groups[boost].append(f"{name}（↓{lower}）")
+    lines = ["性格速查（↑=该项能力值 +10%，↓=该项 -10%）："]
+    for key in ("攻击", "防御", "速度", "特攻", "特防", "中性"):
+        label = "中性（无修正）" if key == "中性" else f"{key}↑"
+        lines.append(f"{label}：{'、'.join(groups[key])}")
+    return "\n".join(lines)
 
 
 @register(
@@ -332,6 +377,27 @@ class PokedexPlugin(Star):
             f"类别：{r.get('category_path', '')}\n说明：{r.get('description', '')}"
         )
 
+    @filter.command("性格")
+    async def cmd_nature(self, event: AstrMessageEvent, keyword: str = ""):
+        """性格速查：性格 [名称]"""
+        keyword = (keyword or "").strip()
+        if not keyword:
+            yield event.plain_result(
+                nature_table_text() + "\n性格 <名称> 查看单个性格详情"
+            )
+            return
+        if keyword in NATURES:
+            yield event.plain_result(nature_effect_text(keyword))
+            return
+        hits = [n for n in NATURES if keyword in n]
+        if len(hits) == 1:
+            yield event.plain_result(nature_effect_text(hits[0]))
+            return
+        hint = f"，相近的有：{'、'.join(hits)}" if hits else ""
+        yield event.plain_result(
+            f"没有性格「{keyword}」{hint}\n发送「性格」查看全部 25 种性格"
+        )
+
     @staticmethod
     def _ability_correction_text(result: dict) -> str:
         """把 matchups 的 ability_corrections 压成一行提示，无修正返回空串。"""
@@ -411,12 +477,15 @@ class PokedexPlugin(Star):
             f"{row.get('name_zh', '')}（{row.get('types', '')}）Lv.{level}"
             f"｜个体 {iv}、努力 0" + (f"、性格 {nature}" if nature else "")
         )
-        return (
+        text = (
             head
             + "\n"
             + "、".join(f"{k} {stats[k]}" for k in STAT_KEYS)
             + f"\n总和 {stats['总和']}"
         )
+        if nature:
+            text += f"\n{nature_effect_text(nature)}"
+        return text
 
     @staticmethod
     def _parse_clamped_int(text: str, default: int, lo: int, hi: int) -> int:
@@ -435,7 +504,7 @@ class PokedexPlugin(Star):
             return
         if nature and nature not in NATURES:
             yield event.plain_result(
-                f"没有性格「{nature}」，可选：{'、'.join(NATURES)}"
+                f"没有性格「{nature}」，发送「性格」可查看全部性格速查"
             )
             return
         level_i = self._parse_clamped_int(level, 50, 1, 100)
@@ -796,6 +865,8 @@ class PokedexPlugin(Star):
         lines = [
             f"【许愿星基拉祈】性格 {nature or '任意'} · 个体≥{iv_floor}（命中 {count} 个种子）"
         ]
+        if nature in NATURES:
+            lines.append(nature_effect_text(nature))
         for i, r in enumerate(rows, 1):
             ivs = "/".join(r[k] for k in ("hp", "atk", "def", "spa", "spd", "spe"))
             mark = " ✨异色" if r.get("shiny") else ""
@@ -1255,6 +1326,7 @@ class PokedexPlugin(Star):
             "宝可梦 <名称> 招式表 [等级] — 可学招式与推荐配招\n"
             "宝可梦 <名称> 能力值 [等级 个体 性格] — 等级能力值计算\n"
             "特性 <名称> / 招式 <名称> / 道具 <名称> — 数据查询\n"
+            "性格 [名称] — 性格能力修正速查（性格 固执 看单个）\n"
             "相性 <属性1> [属性2] / 相性 打 <属性> — 属性相性防守/进攻\n"
             "克制 <宝可梦> / 克制 <A> <B> — 克制推荐与多维度对比\n"
             "对战 <名称1> <名称2> [等级] — 模拟对战（含双方冠军赛名次）\n"
@@ -1391,6 +1463,24 @@ class PokedexPlugin(Star):
             f"道具 {r.get('name_zh', '')}（{r.get('name_en', '')}）\n"
             f"类别：{r.get('category_path', '')}\n说明：{r.get('description', '')}"
         )
+
+    @filter.llm_tool(name="query_nature")
+    async def tool_query_nature(self, event: AstrMessageEvent, keyword: str = ""):
+        """查询对战性格（共 25 种）：能力值提升/下降项与口味偏好，用于配招、喂树果或选性格。
+        Args:
+            keyword(str): 性格中文名（如 固执/胆小/内敛），留空返回全部性格分组速查表
+        """
+        keyword = (keyword or "").strip()
+        if not keyword:
+            return nature_table_text()
+        if keyword in NATURES:
+            return nature_effect_text(keyword)
+        hits = [n for n in NATURES if keyword in n]
+        if len(hits) == 1:
+            return nature_effect_text(hits[0])
+        if hits:
+            return f"「{keyword}」匹配到多个性格：{'、'.join(hits)}"
+        return f"没有性格「{keyword}」。全部性格：{'、'.join(NATURES)}"
 
     @filter.llm_tool(name="query_dex_region")
     async def tool_query_dex_region(self, event: AstrMessageEvent, keyword: str):
@@ -1825,7 +1915,7 @@ class PokedexPlugin(Star):
         if not row:
             return f"没有查到「{keyword}」的相关信息"
         if nature and nature not in NATURES:
-            return f"没有性格「{nature}」，可选：{'、'.join(NATURES)}"
+            return f"没有性格「{nature}」。\n{nature_table_text()}"
         return self._calc_stats_text(
             row, max(1, min(100, int(level))), max(0, min(31, int(iv))), nature
         )
